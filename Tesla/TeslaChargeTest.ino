@@ -1,12 +1,8 @@
 /*
- * TeslaChargeTest.ino = Tesla Test Controller – ESP32-C6
- * Eenvoudige webinterface om data te bekijken en laden te sturen
- * via een tesla-key-esp32 (BLE proxy).
+ * TeslaChargeTest.ino = Tesla Test Controller – ESP32-C6  (uitgebreide versie)
+ * Toont alle beschikbare data via tesla-key-esp32 + laadbediening
  *
- * Vereisten:
- *  - ESP32-C6 met WiFi
- *  - tesla-key-esp32 al geïnstalleerd + gepaard met de auto
- *  - Libraries: ESPAsyncWebServer, AsyncTCP, ArduinoJson
+ * Libraries: ESPAsyncWebServer, AsyncTCP, ArduinoJson
  */
 
 #include <WiFi.h>
@@ -15,20 +11,16 @@
 #include <ArduinoJson.h>
 
 // ========== AANPASSEN ==========
-const char* WIFI_SSID     = "jouw-wifi";
-const char* WIFI_PASS     = "jouw-wachtwoord";
-
-const char* TESLA_KEY_HOST = "192.168.0.xx";   // IP van tesla-key-esp32
-// of:  "tesla-key-esp32.local"
-
-const char* TESLA_VIN      = "5YJ3E7EA0JF000000";  // jouw VIN
+const char* WIFI_SSID      = "jouw-wifi";
+const char* WIFI_PASS      = "jouw-wachtwoord";
+const char* TESLA_KEY_HOST = "192.168.0.xx";        // of tesla-key-esp32.local
+const char* TESLA_VIN      = "5YJ3E7EA0JF000000";   // jouw VIN
 // ==============================
 
 AsyncWebServer server(80);
 
-// Laatste opgehaalde data
-String  lastJson     = "{}";
-String  lastError    = "";
+String  lastJson   = "{}";
+String  lastError  = "";
 unsigned long lastFetch = 0;
 
 // ---------- HTTP helpers ----------
@@ -36,7 +28,7 @@ String httpGet(const String& path) {
   HTTPClient http;
   String url = String("http://") + TESLA_KEY_HOST + path;
   http.begin(url);
-  http.setTimeout(8000);
+  http.setTimeout(10000);
   int code = http.GET();
   String body = (code == 200) ? http.getString() : "";
   if (code != 200) lastError = "GET " + path + " → HTTP " + String(code);
@@ -49,7 +41,7 @@ bool httpPost(const String& path, const String& body = "") {
   String url = String("http://") + TESLA_KEY_HOST + path;
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(10000);
+  http.setTimeout(12000);
   int code = http.POST(body);
   bool ok = (code == 200);
   if (!ok) lastError = "POST " + path + " → HTTP " + String(code);
@@ -57,18 +49,17 @@ bool httpPost(const String& path, const String& body = "") {
   return ok;
 }
 
-// ---------- Data ophalen ----------
 void fetchVehicleData() {
   String path = String("/api/1/vehicles/") + TESLA_VIN + "/vehicle_data";
   String body = httpGet(path);
-  if (body.length() > 10) {
+  if (body.length() > 20) {
     lastJson = body;
     lastError = "";
   }
   lastFetch = millis();
 }
 
-// ---------- HTML pagina ----------
+// ---------- HTML ----------
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -77,43 +68,88 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Tesla Test Controller</title>
   <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 0; background: #f0f2f5; color: #222; }
-    .hdr { background: #cc0000; color: white; padding: 14px 18px; font-size: 18px; font-weight: 600; }
-    .card { background: white; margin: 14px; border-radius: 10px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
-    h2 { margin: 0 0 12px; font-size: 15px; color: #555; text-transform: uppercase; letter-spacing: .5px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; }
-    .label { color: #666; font-size: 13px; }
-    .value { font-size: 18px; font-weight: 600; }
-    .btn { display: inline-block; padding: 10px 18px; margin: 4px 6px 4px 0; border: none; border-radius: 6px;
-           font-size: 14px; font-weight: 600; cursor: pointer; color: white; }
-    .btn-green { background: #2a8a3e; }
-    .btn-red   { background: #c00; }
-    .btn-blue  { background: #036; }
-    .btn-gray  { background: #666; }
-    .btn:active { opacity: .8; }
-    input[type=range] { width: 100%; max-width: 280px; }
-    .status { font-size: 13px; color: #666; margin-top: 8px; }
-    .err { color: #c00; font-weight: 600; }
-    #ampsVal { font-weight: 700; color: #036; }
+    body{font-family:system-ui,Arial,sans-serif;margin:0;background:#f0f2f5;color:#222}
+    .hdr{background:#cc0000;color:#fff;padding:14px 18px;font-size:18px;font-weight:600}
+    .card{background:#fff;margin:12px;border-radius:10px;padding:14px 16px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+    h2{margin:0 0 10px;font-size:13px;color:#666;text-transform:uppercase;letter-spacing:.4px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px}
+    .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 10px}
+    .label{color:#666;font-size:12px}
+    .value{font-size:16px;font-weight:600}
+    .btn{display:inline-block;padding:9px 16px;margin:4px 5px 4px 0;border:none;border-radius:6px;
+         font-size:13px;font-weight:600;cursor:pointer;color:#fff}
+    .btn-green{background:#2a8a3e}.btn-red{background:#c00}.btn-blue{background:#036}.btn-gray{background:#555}
+    .btn:active{opacity:.85}
+    input[type=range]{width:100%;max-width:260px}
+    .status{font-size:12px;color:#666;margin-top:6px}
+    .err{color:#c00;font-weight:600}
+    #ampsVal{font-weight:700;color:#036}
+    .badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600}
+    .ok{background:#d4edda;color:#155724}.warn{background:#fff3cd;color:#856404}.bad{background:#f8d7da;color:#721c24}
   </style>
 </head>
 <body>
-  <div class="hdr">Tesla Test Controller</div>
+  <div class="hdr">Tesla Test Controller <small style="font-weight:400;opacity:.8">– alle velden</small></div>
 
+  <!-- CHARGE -->
   <div class="card">
-    <h2>Live data</h2>
+    <h2>Charge</h2>
     <div class="grid">
       <div><div class="label">Batterij</div><div class="value" id="soc">—</div></div>
+      <div><div class="label">Usable</div><div class="value" id="usable">—</div></div>
       <div><div class="label">Laadstatus</div><div class="value" id="state">—</div></div>
-      <div><div class="label">Huidige ampère</div><div class="value" id="amps">—</div></div>
-      <div><div class="label">Vermogen</div><div class="value" id="power">—</div></div>
       <div><div class="label">Charge limit</div><div class="value" id="limit">—</div></div>
+      <div><div class="label">Huidige A</div><div class="value" id="amps">—</div></div>
+      <div><div class="label">Requested A</div><div class="value" id="reqAmps">—</div></div>
+      <div><div class="label">Vermogen</div><div class="value" id="power">—</div></div>
+      <div><div class="label">Spanning</div><div class="value" id="volt">—</div></div>
+      <div><div class="label">Fasen</div><div class="value" id="phases">—</div></div>
+      <div><div class="label">Energy added</div><div class="value" id="energy">—</div></div>
+      <div><div class="label">Minuten tot vol</div><div class="value" id="ttf">—</div></div>
       <div><div class="label">Range</div><div class="value" id="range">—</div></div>
+      <div><div class="label">Laadpoort</div><div class="value" id="port">—</div></div>
+      <div><div class="label">Latch</div><div class="value" id="latch">—</div></div>
     </div>
-    <div class="status" id="ts">Laatste update: —</div>
-    <div class="status err" id="err"></div>
   </div>
 
+  <!-- CLIMATE -->
+  <div class="card">
+    <h2>Climate</h2>
+    <div class="grid">
+      <div><div class="label">Binnen</div><div class="value" id="inside">—</div></div>
+      <div><div class="label">Buiten</div><div class="value" id="outside">—</div></div>
+      <div><div class="label">Driver set</div><div class="value" id="drvTemp">—</div></div>
+      <div><div class="label">Passenger set</div><div class="value" id="pasTemp">—</div></div>
+      <div><div class="label">Climate aan</div><div class="value" id="climateOn">—</div></div>
+      <div><div class="label">Auto conditioning</div><div class="value" id="autoCond">—</div></div>
+    </div>
+  </div>
+
+  <!-- VEHICLE / CLOSURES -->
+  <div class="card">
+    <h2>Vehicle / Closures</h2>
+    <div class="grid">
+      <div><div class="label">Vergrendeld</div><div class="value" id="locked">—</div></div>
+      <div><div class="label">User present</div><div class="value" id="user">—</div></div>
+      <div><div class="label">Asleep</div><div class="value" id="asleep">—</div></div>
+      <div><div class="label">Odometer</div><div class="value" id="odo">—</div></div>
+      <div><div class="label">Frunk</div><div class="value" id="frunk">—</div></div>
+      <div><div class="label">Trunk</div><div class="value" id="trunk">—</div></div>
+    </div>
+  </div>
+
+  <!-- TYRES -->
+  <div class="card">
+    <h2>Tyre pressure (bar)</h2>
+    <div class="grid3">
+      <div><div class="label">FL</div><div class="value" id="tpFL">—</div></div>
+      <div><div class="label">FR</div><div class="value" id="tpFR">—</div></div>
+      <div><div class="label">RL</div><div class="value" id="tpRL">—</div></div>
+      <div><div class="label">RR</div><div class="value" id="tpRR">—</div></div>
+    </div>
+  </div>
+
+  <!-- CONTROLS -->
   <div class="card">
     <h2>Bediening</h2>
     <button class="btn btn-green" onclick="cmd('charge_start')">▶ Start laden</button>
@@ -125,48 +161,102 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
            oninput="document.getElementById('ampsVal').textContent=this.value">
     <br>
     <button class="btn btn-blue" onclick="setAmps()">Zet ampère</button>
-  </div>
-
-  <div class="card">
-    <h2>Extra</h2>
+    <br><br>
     <button class="btn btn-gray" onclick="cmd('charge_port_door_open')">Open laadpoort</button>
     <button class="btn btn-gray" onclick="cmd('charge_port_door_close')">Sluit laadpoort</button>
   </div>
 
+  <div class="card">
+    <div class="status" id="ts">Laatste update: —</div>
+    <div class="status err" id="err"></div>
+  </div>
+
 <script>
+function val(obj, path, fallback='—') {
+  try {
+    return path.split('.').reduce((o,k)=> (o||{})[k], obj) ?? fallback;
+  } catch(e){ return fallback; }
+}
+function boolBadge(v) {
+  if (v === true)  return '<span class="badge ok">ja</span>';
+  if (v === false) return '<span class="badge bad">nee</span>';
+  return '—';
+}
+function num(v, dec=1, unit='') {
+  if (v === null || v === undefined || v === '—') return '—';
+  return Number(v).toFixed(dec) + (unit ? ' '+unit : '');
+}
+
 function refresh() {
-  fetch('/data').then(r => r.json()).then(d => {
+  fetch('/data').then(r=>r.json()).then(d=>{
     if (d.error) {
       document.getElementById('err').textContent = d.error;
       return;
     }
     document.getElementById('err').textContent = '';
+
     const cs = d.charge_state || {};
-    document.getElementById('soc').textContent   = (cs.battery_level ?? '—') + ' %';
-    document.getElementById('state').textContent = cs.charging_state || '—';
-    document.getElementById('amps').textContent  = (cs.charge_amps ?? '—') + ' A';
-    document.getElementById('power').textContent = (cs.charger_power ?? '—') + ' kW';
-    document.getElementById('limit').textContent = (cs.charge_limit_soc ?? '—') + ' %';
-    document.getElementById('range').textContent = (cs.battery_range ?? '—') + ' km';
-    document.getElementById('ts').textContent    = 'Laatste update: ' + new Date().toLocaleTimeString('nl-BE');
-  }).catch(e => {
+    const cl = d.climate_state || {};
+    const vs = d.vehicle_state || d.closures_state || {};
+    const tp = d.tire_pressure_state || d.tyre_pressure_state || {};
+
+    // Charge
+    document.getElementById('soc').textContent    = (cs.battery_level ?? '—') + ' %';
+    document.getElementById('usable').textContent = (cs.usable_battery_level ?? '—') + ' %';
+    document.getElementById('state').textContent  = cs.charging_state || '—';
+    document.getElementById('limit').textContent  = (cs.charge_limit_soc ?? '—') + ' %';
+    document.getElementById('amps').textContent   = (cs.charge_amps ?? cs.charger_actual_current ?? '—') + ' A';
+    document.getElementById('reqAmps').textContent= (cs.charge_current_request ?? '—') + ' A';
+    document.getElementById('power').textContent  = (cs.charger_power ?? '—') + ' kW';
+    document.getElementById('volt').textContent   = (cs.charger_voltage ?? '—') + ' V';
+    document.getElementById('phases').textContent = cs.charger_phases ?? '—';
+    document.getElementById('energy').textContent = num(cs.charge_energy_added, 2, 'kWh');
+    document.getElementById('ttf').textContent    = cs.minutes_to_full_charge ?? '—';
+    document.getElementById('range').textContent  = num(cs.battery_range ?? cs.ideal_battery_range, 1, 'km');
+    document.getElementById('port').innerHTML     = boolBadge(cs.charge_port_door_open);
+    document.getElementById('latch').textContent  = cs.charge_port_latch || '—';
+
+    // Climate
+    document.getElementById('inside').textContent  = num(cl.inside_temp, 1, '°C');
+    document.getElementById('outside').textContent = num(cl.outside_temp, 1, '°C');
+    document.getElementById('drvTemp').textContent = num(cl.driver_temp_setting, 1, '°C');
+    document.getElementById('pasTemp').textContent = num(cl.passenger_temp_setting, 1, '°C');
+    document.getElementById('climateOn').innerHTML = boolBadge(cl.is_climate_on);
+    document.getElementById('autoCond').innerHTML  = boolBadge(cl.is_auto_conditioning_on);
+
+    // Vehicle
+    document.getElementById('locked').innerHTML  = boolBadge(vs.locked);
+    document.getElementById('user').innerHTML    = boolBadge(vs.is_user_present);
+    document.getElementById('asleep').innerHTML  = boolBadge(d.is_asleep ?? vs.is_asleep);
+    document.getElementById('odo').textContent   = num(vs.odometer, 1, 'km');
+    document.getElementById('frunk').innerHTML   = boolBadge(vs.ft ?? vs.front_trunk);
+    document.getElementById('trunk').innerHTML   = boolBadge(vs.rt ?? vs.rear_trunk);
+
+    // Tyres (Tesla levert vaak in bar × 10 of al in bar – we tonen wat er is)
+    document.getElementById('tpFL').textContent = num(tp.front_left  ?? tp.fl, 2);
+    document.getElementById('tpFR').textContent = num(tp.front_right ?? tp.fr, 2);
+    document.getElementById('tpRL').textContent = num(tp.rear_left   ?? tp.rl, 2);
+    document.getElementById('tpRR').textContent = num(tp.rear_right  ?? tp.rr, 2);
+
+    document.getElementById('ts').textContent = 'Laatste update: ' + new Date().toLocaleTimeString('nl-BE');
+  }).catch(()=>{
     document.getElementById('err').textContent = 'Kan data niet ophalen';
   });
 }
 
 function cmd(name) {
-  fetch('/cmd?c=' + name, { method: 'POST' })
-    .then(r => r.text())
-    .then(t => { alert(t); setTimeout(refresh, 1500); })
-    .catch(() => alert('Fout bij commando'));
+  fetch('/cmd?c=' + name, {method:'POST'})
+    .then(r=>r.text())
+    .then(t=>{ alert(t); setTimeout(refresh, 2000); })
+    .catch(()=>alert('Fout bij commando'));
 }
 
 function setAmps() {
   const a = document.getElementById('ampsSlider').value;
-  fetch('/cmd?c=set_charging_amps&amps=' + a, { method: 'POST' })
-    .then(r => r.text())
-    .then(t => { alert(t); setTimeout(refresh, 1500); })
-    .catch(() => alert('Fout bij ampère instellen'));
+  fetch('/cmd?c=set_charging_amps&amps=' + a, {method:'POST'})
+    .then(r=>r.text())
+    .then(t=>{ alert(t); setTimeout(refresh, 2000); })
+    .catch(()=>alert('Fout bij ampère'));
 }
 
 refresh();
@@ -180,7 +270,7 @@ setInterval(refresh, 5000);
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== Tesla Test Controller ===");
+  Serial.println("\n=== Tesla Test Controller (uitgebreid) ===");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -191,34 +281,36 @@ void setup() {
   }
   Serial.println("\nIP: " + WiFi.localIP().toString());
 
-  // Hoofdpagina
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
     req->send_P(200, "text/html", INDEX_HTML);
   });
 
-  // Data endpoint (proxy)
   server.on("/data", HTTP_GET, [](AsyncWebServerRequest *req) {
     if (millis() - lastFetch > 4000) fetchVehicleData();
 
-    // Eenvoudige extractie van charge_state
-    StaticJsonDocument<2048> doc;
+    // We sturen de ruwe JSON door zodat de frontend alle nested objecten kan lezen
+    // (charge_state, climate_state, vehicle_state, tire_pressure_state, …)
+    StaticJsonDocument<4096> doc;
     DeserializationError err = deserializeJson(doc, lastJson);
+
     if (err || lastError.length()) {
-      String e = lastError.length() ? lastError : "JSON parse error";
+      String e = lastError.length() ? lastError : String("JSON parse error");
       req->send(200, "application/json", "{\"error\":\"" + e + "\"}");
       return;
     }
 
-    // Geef alleen het relevante deel door
-    JsonObject resp = doc["response"]["response"];
-    if (resp.isNull()) resp = doc["response"];   // fallback
+    // tesla-key-esp32 retourneert meestal:
+    // { "response": { "response": { charge_state:…, climate_state:… } } }
+    // of soms al direct onder response
+    JsonObject root = doc["response"]["response"];
+    if (root.isNull()) root = doc["response"];
+    if (root.isNull()) root = doc.as<JsonObject>();
 
     String out;
-    serializeJson(resp, out);
+    serializeJson(root, out);
     req->send(200, "application/json", out);
   });
 
-  // Commando endpoint
   server.on("/cmd", HTTP_POST, [](AsyncWebServerRequest *req) {
     if (!req->hasArg("c")) {
       req->send(400, "text/plain", "Missing command");
@@ -240,10 +332,9 @@ void setup() {
 
   server.begin();
   fetchVehicleData();
-  Serial.println("Klaar → open http://" + WiFi.localIP().toString());
+  Serial.println("Klaar → http://" + WiFi.localIP().toString());
 }
 
 void loop() {
-  // niets – alles async
   delay(1000);
 }
