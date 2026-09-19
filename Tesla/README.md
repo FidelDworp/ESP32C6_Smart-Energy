@@ -56,6 +56,52 @@ POST /api/1/vehicles/{VIN}/command/set_charging_amps
 Body: {"charging_amps": 16}
 De web-UI toont status (batterij, laadstatus, enz.).
 
+Beschikbaar: REST JSON API op poort 80 van de tesla-key-esp32. Geen websockets of speciale protocollen nodig.
+Antwoord is JSON, ongeveer in deze vorm:
+
+JSON{
+  "response": {
+    "response": {
+      "charge_state": {
+        "battery_level": 72,
+        "usable_battery_level": 71,
+        "charging_state": "Charging",
+        "charge_amps": 16,
+        "charger_power": 3.7,
+        "charger_voltage": 230,
+        "charger_phases": 1,
+        "charge_limit_soc": 80,
+        "charge_energy_added": 12.4,
+        "minutes_to_full_charge": 95,
+        "battery_range": 280.5,
+        "charge_port_door_open": true,
+        "charge_port_latch": "Engaged",
+        ...
+      },
+      "climate_state": {
+        "inside_temp": 21.5,
+        "outside_temp": 14.2,
+        "driver_temp_setting": 21.0,
+        "is_climate_on": false,
+        ...
+      },
+      "vehicle_state": {
+        "locked": true,
+        "odometer": 45230.1,
+        "is_user_present": false,
+        ...
+      },
+      "tire_pressure_state": {
+        "front_left": 2.9,
+        "front_right": 2.9,
+        "rear_left": 2.8,
+        "rear_right": 2.8
+      }
+      // eventueel nog closures_state, drive_state, ...
+    }
+  }
+}
+
 Opm: Het project is AGPL-3.0 en volledig open source. Houd het alleen op je vertrouwde LAN (niet openzetten naar internet).
 
 ---
