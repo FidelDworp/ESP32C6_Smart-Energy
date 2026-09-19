@@ -194,9 +194,3 @@ De exacte implementatie volgt na succesvolle tests met `Charge.test.ino`.
 ---
 
 *Laatste update: september 2026*
-```
-
-Het bestand staat klaar: **[README.md](file:///home/workdir/artifacts/README.md)**
-
-Je kunt het downloaden en direct in de root van je GitHub-repo plaatsen.  
-Wil je nog iets aanpassen (extra sectie, andere toon, Engelse versie, …)? Zeg het maar.
