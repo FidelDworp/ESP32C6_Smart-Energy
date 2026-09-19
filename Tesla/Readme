@@ -30,6 +30,34 @@ Jouw eigen ESP32 praat er via eenvoudige HTTP-calls mee.
 Bron van de proxy:  
 [https://github.com/0Bu/tesla-key-esp32](https://github.com/0Bu/tesla-key-esp32)
 
+Stappen
+
+1. Firmware installeren
+Ga naar de web-installer: https://0bu.github.io/tesla-key-esp32/
+Chrome/Edge, USB-kabel, selecteer je ESP32-C6.
+Klik Install (eerste keer volledige erase).
+
+2. WiFi + VIN configureren
+Verbind met het open netwerk tesla-key-esp32-setup.
+Ga naar http://192.168.4.1 en vul je WiFi + 17-cijferige VIN in.
+Apparaat herstart en komt op je netwerk.
+
+3. Pairen met de auto
+Zet de ESP32 dicht bij de auto (binnen ~10 m).
+Open http://tesla-key-esp32.local.
+Leg een Tesla NFC-keycard op de middenconsole.
+Bevestig op het scherm van de auto “Add key”.
+In de web-UI zie je “paired”.
+
+4. Bedienen
+Via de web-UI of rechtstreeks via HTTP (perfect voor een eenvoudige eigen site):textPOST /api/1/vehicles/{VIN}/command/charge_start
+POST /api/1/vehicles/{VIN}/command/charge_stop
+POST /api/1/vehicles/{VIN}/command/set_charging_amps
+Body: {"charging_amps": 16}
+De web-UI toont status (batterij, laadstatus, enz.).
+
+Opm: Het project is AGPL-3.0 en volledig open source. Houd het alleen op je vertrouwde LAN (niet openzetten naar internet).
+
 ---
 
 ## Vereisten
