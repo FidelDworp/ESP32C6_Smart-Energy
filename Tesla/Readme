@@ -1,1 +1,174 @@
+# Tesla Smart Charging – ESP32-C6
 
+Lokale sturing van het laden van een Tesla via een ESP32-C6, volledig zonder cloud of officiële Tesla API.
+
+Dit project bestaat uit twee fasen:
+
+1. **Charge.test.ino** – eenvoudige testinterface om de communicatie met de Tesla te valideren
+2. **ESP32_C6_ENERGY_v1_27.ino** – definitieve integratie in de bestaande energie-controller (solar, schuur, EPEX, P1)
+
+---
+
+## Architectuur
+
+```text
+┌─────────────────────────────┐
+│  ESP32-C6 (tesla-key-esp32) │  ← BLE-sleutel (Charging Manager)
+│  Dicht bij de auto          │
+└──────────────┬──────────────┘
+               │ HTTP (lokaal)
+┌──────────────▼──────────────┐
+│  ESP32-C6 (jouw controller) │
+│  - Charge.test.ino (test)   │
+│  - of ENERGY_v1_27 (live)   │
+└─────────────────────────────┘
+```
+
+De **tesla-key-esp32** fungeert als Bluetooth Low Energy proxy.  
+Jouw eigen ESP32 praat er via eenvoudige HTTP-calls mee.
+
+Bron van de proxy:  
+[https://github.com/0Bu/tesla-key-esp32](https://github.com/0Bu/tesla-key-esp32)
+
+---
+
+## Vereisten
+
+| Component              | Opmerking                                      |
+|------------------------|------------------------------------------------|
+| ESP32-C6 (1×)          | Voor **tesla-key-esp32** (dicht bij de auto)   |
+| ESP32-C6 (1×)          | Voor de test- of energy-sketch                 |
+| Tesla                  | Gepaard als *Charging Manager*                 |
+| WiFi                   | Zelfde netwerk                                 |
+| Libraries              | ESPAsyncWebServer, AsyncTCP, ArduinoJson       |
+
+---
+
+## Fase 1 – Charge.test.ino
+
+Eenvoudige webinterface om de verbinding en alle laadcommando’s te testen.
+
+### Functionaliteit
+
+- Live data van de Tesla (batterij %, laadstatus, ampère, vermogen, charge limit, range)
+- Knoppen:
+  - Start laden
+  - Stop laden
+  - Wake-up
+  - Open / sluit laadpoort
+- Slider om de laadstroom in te stellen (5–32 A)
+
+### Installatie
+
+1. Flash eerst **tesla-key-esp32** op een ESP32-C6 en pair deze met de auto.
+2. Noteer het IP-adres van de tesla-key-esp32.
+3. Open `Charge.test.ino` en vul in:
+
+   ```cpp
+   const char* WIFI_SSID      = "jouw-wifi";
+   const char* WIFI_PASS      = "jouw-wachtwoord";
+   const char* TESLA_KEY_HOST = "192.168.0.xx";   // of tesla-key-esp32.local
+   const char* TESLA_VIN      = "5YJ............";
+   ```
+
+4. Upload naar een **tweede** ESP32-C6.
+5. Open in de browser het IP-adres van deze test-ESP.
+
+### Belangrijkste API-calls
+
+| Actie              | Endpoint                                      | Body                          |
+|--------------------|-----------------------------------------------|-------------------------------|
+| Data ophalen       | `GET /api/1/vehicles/{VIN}/vehicle_data`      | –                             |
+| Start laden        | `POST .../command/charge_start`               | (leeg of `true`)              |
+| Stop laden         | `POST .../command/charge_stop`                | (leeg of `false`)             |
+| Ampère instellen   | `POST .../command/set_charging_amps`          | `{"charging_amps": 16}`       |
+| Wake-up            | `POST .../command/wake_up`                    | –                             |
+
+---
+
+## Fase 2 – Integratie in ESP32_C6_ENERGY_v1_27.ino
+
+De bestaande energie-controller meet al:
+
+- Zonneproductie (`w_sol`)
+- Schuur afname / injectie (`w_schf`, `w_schr`)
+- WON (P1 of simulatie)
+- EPEX-prijs
+- Nettovermogen en maandpiek
+
+### Doel
+
+Automatisch de Tesla laden met de **beschikbare surplus** (of bij lage EPEX-prijs), zonder de maandpiek te overschrijden.
+
+### Geplande stuurlogica (voorbeeld)
+
+```cpp
+// Elke 15–30 seconden
+float surplus_w = w_sol - w_schf + w_schr;   // of uitgebreidere berekening
+
+bool goed_moment = (epex_nu < 18.0f) || (w_sol > 1500.0f);
+
+int target_amps = 0;
+if (goed_moment && surplus_w > 1200.0f) {
+  target_amps = constrain((int)(surplus_w / 230.0f), 5, 16);  // 1-fase
+  // of / 690.0f bij 3-fase
+}
+
+setTeslaAmps(target_amps);   // start of stop automatisch
+```
+
+### Belangrijke ontwerpkeuzes
+
+- Hysterese (alleen wijzigen bij ≥ 2 A verschil) om flappen te voorkomen
+- Maximum frequentie van commando’s (15–30 s) om de auto niet onnodig wakker te maken
+- Respecteren van de maandpiek (`max_piek_w`)
+- Optioneel: alleen laden bij lage EPEX of voldoende solar
+
+De exacte implementatie volgt na succesvolle tests met `Charge.test.ino`.
+
+---
+
+## Bestanden in deze repo
+
+| Bestand                        | Beschrijving                                      |
+|--------------------------------|---------------------------------------------------|
+| `Charge.test.ino`              | Standalone testinterface                          |
+| `ESP32_C6_ENERGY_v1_27.ino`    | Bestaande energie-controller (nog zonder Tesla)   |
+| `README.md`                    | Dit document                                      |
+
+---
+
+## Status
+
+| Onderdeel                      | Status            |
+|--------------------------------|-------------------|
+| tesla-key-esp32 hardware       | Te installeren    |
+| Charge.test.ino                | Klaar om te testen|
+| Integratie in ENERGY_v1_27     | Gepland           |
+| Live surplus-sturing           | Gepland           |
+
+---
+
+## Notities & aandachtspunten
+
+- De tesla-key-esp32 moet **dicht bij de auto** staan (BLE-bereik).
+- Eerste commando na lange stilte kan 5–15 seconden duren (wake + BLE reconnect).
+- De API heeft geen authenticatie – alleen gebruiken op een vertrouwd LAN.
+- Begin altijd met een lage `TESLA_MAX_AMPS` tijdens de eerste tests.
+
+---
+
+## Licentie & credits
+
+- tesla-key-esp32: AGPL-3.0 – [0Bu/tesla-key-esp32](https://github.com/0Bu/tesla-key-esp32)
+- Deze controller-sketch: eigen code (Filip Delannoy / Zarlar)
+
+---
+
+*Laatste update: september 2026*
+```
+
+Het bestand staat klaar: **[README.md](file:///home/workdir/artifacts/README.md)**
+
+Je kunt het downloaden en direct in de root van je GitHub-repo plaatsen.  
+Wil je nog iets aanpassen (extra sectie, andere toon, Engelse versie, …)? Zeg het maar.
