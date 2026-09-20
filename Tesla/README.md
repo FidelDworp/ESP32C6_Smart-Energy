@@ -20,7 +20,7 @@ Dit project bestaat uit twee fasen:
 ┌──────────────▼──────────────┐
 │  ESP32-C6 (jouw controller) │
 │  - Charge.test.ino (test)   │
-│  - of ENERGY_v1_27 (live)   │
+│  - ESP32_C6_ENERGY (live)   │
 └─────────────────────────────┘
 ```
 
