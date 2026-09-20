@@ -5,7 +5,7 @@ Lokale sturing van het laden van een Tesla via een ESP32-C6, volledig zonder clo
 Dit project bestaat uit twee fasen:
 
 1. **TeslaChargeTest.ino** – eenvoudige testinterface om de communicatie met de Tesla te valideren
-2. **ESP32_C6_ENERGY_v1_27.ino** – definitieve integratie in de bestaande energie-controller (solar, schuur, EPEX, P1)
+2. **ESP32_C6_ENERGY.ino** – definitieve integratie in de bestaande energie-controller (solar, schuur, EPEX, P1)
 
 ---
 
