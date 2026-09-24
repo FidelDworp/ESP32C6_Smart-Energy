@@ -1,5 +1,5 @@
 /*
- * TeslaChargeTest.ino = Tesla Test Controller – ESP32-C6  (uitgebreide versie)
+ * TeslaChargeTest_24sep26_1400.ino = Tesla Test Controller – ESP32-C6
  * Toont alle beschikbare data via tesla-key-esp32 + laadbediening
  *
  * Libraries: ESPAsyncWebServer, AsyncTCP, ArduinoJson
