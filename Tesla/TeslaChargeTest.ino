@@ -10,11 +10,11 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-// ========== AANPASSEN ==========
-const char* WIFI_SSID      = "jouw-wifi";
-const char* WIFI_PASS      = "jouw-wachtwoord";
-const char* TESLA_KEY_HOST = "192.168.0.xx";        // of tesla-key-esp32.local
-const char* TESLA_VIN      = "5YJ3E7EA0JF000000";   // jouw VIN
+// ========== EIGEN DATA ==========
+const char* WIFI_SSID      = "Delannoy";
+const char* WIFI_PASS      = "kampendaal,34";
+const char* TESLA_KEY_HOST = "192.168.0.134";        // of tesla-key-esp32.local
+const char* TESLA_VIN      = "LRW3E7EK5RC965673";   // jouw VIN
 // ==============================
 
 AsyncWebServer server(80);
