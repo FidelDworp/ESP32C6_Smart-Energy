@@ -39,17 +39,21 @@ Klik Install (eerste keer volledige erase).
 
 2. WiFi + VIN configureren
 Verbind met het open netwerk tesla-key-esp32-setup.
-Ga naar http://192.168.4.1 en vul je WiFi + 17-cijferige VIN in.
-Apparaat herstart en komt op je netwerk.
+Wacht op de automatische webpage (Of ga naar http://192.168.4.1) en vul je WiFi + 17-cijferige VIN in.
+=> Apparaat herstart en komt op je netwerk.
 
-3. Pairen met de auto
+Opm: In Zarlardinge kreeg deze controller IP: 192.168.0.134
+
+4. Pairen met de auto
 Zet de ESP32 dicht bij de auto (binnen ~10 m).
 Open http://tesla-key-esp32.local.
 Leg een Tesla NFC-keycard op de middenconsole.
 Bevestig op het scherm van de auto “Add key”.
 In de web-UI zie je “paired”.
 
-4. Bedienen
+=> Bij intikken van 192.168.0.134 krijg je de interface te zien: Gepaird of niet + alle andere data.
+
+6. Bedienen
 Via de web-UI of rechtstreeks via HTTP (perfect voor een eenvoudige eigen site):textPOST /api/1/vehicles/{VIN}/command/charge_start
 POST /api/1/vehicles/{VIN}/command/charge_stop
 POST /api/1/vehicles/{VIN}/command/set_charging_amps
