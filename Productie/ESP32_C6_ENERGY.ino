@@ -1,4 +1,4 @@
-// ESP32_C6_ENERGY_v1_27.ino — Zarlar Smart Energy Controller
+// ESP32_C6_ENERGY_v1_28.ino — Zarlar Smart Energy Controller
 // Developed by Filip Delannoy, april 2026.
 // Bereikbaar op http://192.168.0.73
 //
@@ -10,12 +10,27 @@
 //   spiffs,  data, spiffs,0xC10000, 0x3F0000,
 //
 // ── VERSIEHISTORIE ──────────────────────────────────────────
-// 28apr26 v1.27 Matrix layout definitief (EPEX-label 27 april):
-//
-// 25apr26 v1.26 Twee onafhankelijke simulatievlaggen:
-//
+// 24sep26 v1.28 Tesla1: pagina /tesla — data volgen + handmatig start/stop/wake/ampère
+//               via proxy tesla-key-esp32 (BLE). Eigen minimale HTTP-client (geen
+//               HTTPClient/String), stream-parse met ArduinoJson-filter. Geen auto-sturing.
+//               Fix: middernacht-reset elke 5s-tick + dag in NVS (was 3-minutenvenster
+//               in het 15-min-blok, ~1 op 5 kans).
+//               Fix: automatische zomertijd (configTzTime CET/CEST) i.p.v. vaste UTC+2.
+//               TODO-blok onderaan verplaatst naar OPENSTAAND hieronder.
+// 28apr26 v1.27 Matrix layout definitief (EPEX-label 27 april)
+// 25apr26 v1.26 Twee onafhankelijke simulatievlaggen (SIM_S0 / SIM_P1)
 // 25apr26 v1.25 Enkelvoudige SIMULATION_MODE (archief)
 // 24apr26 v1.24 Eerste productieversie — live S0 ISR
+//
+// ── OPENSTAAND ──────────────────────────────────────────────
+//  - ntfy.sh push bij piekdrempel overschreden
+//  - Vaste opslag ophalen via /api/settings (nu hardcoded VAST_CT_KWH)
+//  - fetchP1(): imp_midnight/exp_midnight-snapshot wordt niet bij middernacht vernieuwd
+//    -> WON-dagwaarden lopen op in LIVE-modus (relevant vanaf ~2028)
+//  - piek_w is momentaan en enkel SCH (geen WON, geen kwartiergemiddelde)
+//  - WON individuele piek bijhouden (key pw) zodra P1-dongle actief
+//  - Tesla1 later: solar->tesla1 dag/totaal-tellers, t1_-keys in /json (+ GAS/Dashboard),
+//    matrix-pixels (col 11 rij 2-3 vrij), automatische sturing (solar/EPEX/piek)
 //
 // ── HARDWARE ────────────────────────────────────────────────
 //   ESP32-C6 32-pin · Zarlar shield · IP 192.168.0.73
@@ -70,7 +85,7 @@
 #include <math.h>
 
 // ── VERSIE ──────────────────────────────────────────────────
-#define FW_VERSION   "1.27"
+#define FW_VERSION   "1.28"
 #define CTRL_ID      "S-ENERGY"
 #define NVS_NS       "senrg"
 
@@ -113,7 +128,17 @@ const char* DEF_IP    = "192.168.0.73";
 const char* AP_SSID   = "ZarlarSetup";
 const char* RPI_BASE  = "http://192.168.0.50:3000";
 const char* NTP_SRV   = "pool.ntp.org";
-#define     TZ_SEC     3600
+#define     TZ_INFO    "CET-1CEST,M3.5.0,M10.5.0/3"   // CET/CEST, automatische zomertijd
+
+// ── TESLA1 (proxy tesla-key-esp32) ──────────────────────────
+#define TESLA_POLL_VIEW_MS   15000UL    // poll-interval terwijl /tesla open staat
+#define TESLA_POLL_IDLE_MS  300000UL    // poll-interval als niemand kijkt (5 min)
+#define TESLA_POLL_FAIL_MS   60000UL    // na een mislukte poll
+#define TESLA_GET_TIMEOUT    10000UL    // BLE-antwoorden kunnen traag zijn
+#define TESLA_CMD_TIMEOUT    12000UL    // wake-up kan 5-15 s duren
+#define TESLA_AMPS_MIN           5
+#define TESLA_AMPS_CAP          32      // harde bovengrens voor de instelling
+#define DEF_TESLA_MAXA          16
 
 // ── NVS KEYS ────────────────────────────────────────────────
 const char* NVS_SSID     = "wifi_ssid";
@@ -128,6 +153,10 @@ const char* NVS_MPIEK    = "max_piek_w";
 const char* NVS_SIM_S0   = "sim_s0";   // bool — S0 kanalen simuleren
 const char* NVS_SIM_P1   = "sim_p1";   // bool — P1 dongle simuleren
 const char* NVS_P1_IP    = "p1_ip";    // string — HomeWizard P1 IP adres
+const char* NVS_DAY      = "last_day"; // int — laatst verwerkte dag (YYYYMMDD)
+const char* NVS_T_HOST   = "t1_host";  // string — tesla-key-esp32 host/IP
+const char* NVS_T_VIN    = "t1_vin";   // string — VIN
+const char* NVS_T_MAXA   = "t1_maxa";  // uchar — max laadstroom (A)
 
 // ── OBJECTEN ────────────────────────────────────────────────
 AsyncWebServer    server(80);
@@ -170,7 +199,7 @@ unsigned long t_5s   = 0;
 unsigned long t_15m  = 0;
 unsigned long t_epex = 0;
 unsigned long t_p1   = 0;
-int           last_mday = -1;
+int32_t       last_day  = -1;   // YYYYMMDD laatst verwerkte dag (NVS)
 uint32_t      prev_sol = 0, prev_schf = 0, prev_schr = 0;
 
 // ── ISR ─────────────────────────────────────────────────────
@@ -487,6 +516,445 @@ void fetchEpex() {
   Serial.printf("[EPEX] nu=%.1f ct  +1u=%.1f ct\n", epex_nu, epex_p1h);
 }
 
+// ═════════════════════════════════════════════════════════════
+// TESLA1 — data volgen + handmatig bedienen (v1.28)
+// Via proxy tesla-key-esp32 (BLE, Charging Manager) — REST op poort 80.
+// Geen automatische sturing. Heap-zuinig:
+//   - eigen minimale HTTP/1.0-client op WiFiClient (geen HTTPClient, geen String)
+//   - stream-parse met ArduinoJson-filter: enkel charge_state, ~1,5 KB werkgeheugen op de stack (tijdelijk)
+//   - vaste buffers, statische pagina in PROGMEM (send_P)
+// Blokkerend in loop() met deadline: S0-ISR blijft pulsen tellen, webserver draait apart.
+// ═════════════════════════════════════════════════════════════
+const char* const T1_KEYS[] = {
+  "battery_level", "usable_battery_level", "charging_state", "charge_limit_soc",
+  "charge_amps", "charger_actual_current", "charge_current_request", "charger_power",
+  "charger_voltage", "charger_phases", "charge_energy_added", "minutes_to_full_charge",
+  "battery_range", "ideal_battery_range", "charge_port_door_open"
+};
+#define T1_NKEYS  15
+static_assert(sizeof(T1_KEYS) / sizeof(T1_KEYS[0]) == T1_NKEYS, "T1_NKEYS komt niet overeen met T1_KEYS");
+// Documentgroottes volgen automatisch de slot-grootte van het platform (ESP32: ~0,8 KB + ~0,7 KB, op de stack)
+#define T1_FILTER_CAP (2 * JSON_OBJECT_SIZE(2) + JSON_OBJECT_SIZE(1) + 3 * JSON_OBJECT_SIZE(T1_NKEYS))
+#define T1_DOC_CAP    (2 * JSON_OBJECT_SIZE(1) + JSON_OBJECT_SIZE(T1_NKEYS) + 448)   // + gekopieerde strings
+
+const char* const T1_CMD_PATH[]  = { "", "charge_start", "charge_stop", "wake_up", "set_charging_amps" };
+const char* const T1_CMD_LABEL[] = { "", "start", "stop", "wake-up", "ampere" };
+
+struct Tesla1 {
+  bool     ok         = false;   // laatste poll geslaagd
+  bool     have       = false;   // ooit geldige data ontvangen
+  int16_t  soc = -1, usable = -1, limit = -1;
+  int16_t  a_act = -1, a_req = -1, a_set = -1;
+  int16_t  volt = -1, phases = 0, mins = -1, pk = -1;
+  int32_t  pw         = 0;       // berekend vermogen W (A x V x fasen)
+  float    energy     = 0;       // kWh toegevoegd
+  float    range_km   = -1;
+  int8_t   port       = -1;      // -1 onbekend / 0 dicht / 1 open
+  uint32_t last_ok_ms = 0;
+  char     state[16]  = "";
+  char     msg[40]    = "nog geen data";   // status laatste poll
+  char     cmsg[40]   = "";                // resultaat laatste commando
+};
+Tesla1 t1;
+
+char              t1_host[40]  = "";
+char              t1_vin[20]   = "";
+uint8_t           t1_maxa      = DEF_TESLA_MAXA;
+volatile uint8_t  t1_cmd       = 0;    // 0 geen, 1 start, 2 stop, 3 wake, 4 ampere
+volatile uint8_t  t1_cmd_amps  = 0;
+volatile uint32_t t1_last_view = 0;    // laatste keer dat /tesla_json werd opgevraagd
+uint32_t          t1_next      = 0;    // volgende poll (millis)
+
+bool t1Enabled() { return !ap_mode && t1_host[0] && t1_vin[0]; }
+bool t1Viewed(uint32_t now) { return t1_last_view && (uint32_t)(now - t1_last_view) < 120000UL; }
+
+// Kopieert enkel veilige tekens (host/VIN/status komen ongeëscaped in JSON terecht)
+void t1CopyClean(char* dst, size_t cap, const char* src, bool upper) {
+  size_t n = 0;
+  for (; src && *src && n + 1 < cap; src++) {
+    char ch = *src;
+    if (isalnum((unsigned char)ch) || ch == '.' || ch == '-' || ch == '_')
+      dst[n++] = upper ? (char)toupper((unsigned char)ch) : ch;
+  }
+  dst[n] = 0;
+}
+
+int t1Hex(int ch) {
+  if (ch >= '0' && ch <= '9') return ch - '0';
+  if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+  if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+  return -1;
+}
+
+// Leest één regel (zonder CR/LF). Geeft lengte (0 = lege regel) of -1 bij timeout/einde.
+int t1ReadLine(WiFiClient& c, char* buf, int cap, uint32_t dl) {
+  int n = 0;
+  while ((int32_t)(dl - millis()) > 0) {
+    if (c.available()) {
+      char ch = (char)c.read();
+      if (ch == '\n') { buf[n] = 0; return n; }
+      if (ch != '\r' && n < cap - 1) buf[n++] = ch;
+    } else if (!c.connected()) {
+      break;
+    } else {
+      delay(2);
+    }
+  }
+  buf[n] = 0;
+  return -1;
+}
+
+// Body-stream voor ArduinoJson: decodeert 'Transfer-Encoding: chunked' onderweg
+// (geen buffer van de volledige respons nodig).
+class T1Body : public Stream {
+  WiFiClient& c_;
+  bool        chunked_;
+  uint32_t    dl_;
+  int32_t     left_;
+  bool        eof_;
+  int         pk_;      // -2 = niets in peek-buffer
+  int rawRead() {
+    while ((int32_t)(dl_ - millis()) > 0) {
+      if (c_.available()) return c_.read();
+      if (!c_.connected()) return -1;
+      delay(1);
+    }
+    return -1;
+  }
+  int nextByte() {
+    if (eof_) return -1;
+    if (!chunked_) {
+      int b = rawRead();
+      if (b < 0) eof_ = true;
+      return b;
+    }
+    if (left_ <= 0) {
+      int32_t v = -1; bool ext = false;
+      for (;;) {
+        int b = rawRead();
+        if (b < 0) { eof_ = true; return -1; }
+        if (b == '\n') { if (v >= 0) break; ext = false; continue; }
+        if (ext || b == '\r') continue;
+        if (b == ';') { ext = true; continue; }
+        int h = t1Hex(b);
+        if (h >= 0) v = (v < 0 ? 0 : v) * 16 + h;
+      }
+      if (v == 0) { eof_ = true; return -1; }
+      left_ = v;
+    }
+    int b = rawRead();
+    if (b < 0) { eof_ = true; return -1; }
+    left_--;
+    return b;
+  }
+public:
+  T1Body(WiFiClient& c, bool chunked, uint32_t dl)
+    : c_(c), chunked_(chunked), dl_(dl), left_(0), eof_(false), pk_(-2) { setTimeout(20); }
+  int available() override { return (pk_ != -2 || !eof_) ? 1 : 0; }
+  int read() override {
+    if (pk_ != -2) { int b = pk_; pk_ = -2; return b; }
+    return nextByte();
+  }
+  int peek() override {
+    if (pk_ == -2) pk_ = nextByte();
+    return pk_;
+  }
+  size_t write(uint8_t) override { return 0; }
+};
+
+// Stuurt het verzoek en leest statusregel + headers.
+// Return: HTTP-code, 0 = geen verbinding, -1 = ongeldig/geen antwoord binnen deadline.
+// De client blijft open voor het lezen van de body.
+int t1Open(WiFiClient& c, const char* method, const char* path, const char* body,
+           uint32_t to_ms, bool& chunked, uint32_t& dl) {
+  chunked = false;
+  dl = millis() + to_ms;
+  if (!c.connect(t1_host, 80, 1500)) return 0;
+
+  char hdr[72] = "";
+  if (body) snprintf(hdr, sizeof(hdr), "Content-Type: application/json\r\nContent-Length: %d\r\n", (int)strlen(body));
+  char req[320];
+  int rl = snprintf(req, sizeof(req), "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n%s\r\n%s",
+                    method, path, t1_host, hdr, body ? body : "");
+  if (rl <= 0 || rl >= (int)sizeof(req)) return -1;
+  c.write((const uint8_t*)req, (size_t)rl);   // één segment
+
+  char line[80];
+  int n = t1ReadLine(c, line, sizeof(line), dl);
+  if (n < 12 || strncmp(line, "HTTP/", 5) != 0) return -1;
+  int code = atoi(line + 9);
+  for (;;) {
+    n = t1ReadLine(c, line, sizeof(line), dl);
+    if (n < 0) return -1;
+    if (n == 0) break;
+    for (char* q = line; *q; ++q) *q = (char)tolower((unsigned char)*q);
+    if (strncmp(line, "transfer-encoding:", 18) == 0 && strstr(line, "chunked")) chunked = true;
+  }
+  return code;
+}
+
+// Waarden uit charge_state naar de vaste struct
+void t1Extract(JsonObject cs) {
+  t1.soc    = cs["battery_level"] | -1;
+  t1.usable = cs["usable_battery_level"] | -1;
+  t1.limit  = cs["charge_limit_soc"] | -1;
+  t1CopyClean(t1.state, sizeof(t1.state), cs["charging_state"] | "?", false);
+  int aset  = cs["charge_amps"] | -1;
+  t1.a_set  = aset;
+  t1.a_req  = cs["charge_current_request"] | -1;
+  t1.a_act  = cs["charger_actual_current"] | aset;
+  t1.volt   = cs["charger_voltage"] | -1;
+  t1.phases = cs["charger_phases"] | 0;
+  t1.pk     = cs["charger_power"] | -1;          // kW zoals de auto het meldt (geheel getal)
+  t1.energy = cs["charge_energy_added"] | 0.0f;
+  t1.mins   = cs["minutes_to_full_charge"] | -1;
+  float mi  = cs["battery_range"] | (cs["ideal_battery_range"] | -1.0f);
+  t1.range_km = (mi >= 0) ? mi * 1.60934f : -1.0f;
+  JsonVariant pv = cs["charge_port_door_open"];
+  t1.port   = pv.is<bool>() ? (pv.as<bool>() ? 1 : 0) : -1;
+  // Berekend vermogen — fasen-interpretatie (>=2 => 3-fase) nog te verifiëren tegen echte meting
+  int ph = (t1.phases >= 2) ? 3 : 1;
+  bool laadt = (strcmp(t1.state, "Charging") == 0);
+  t1.pw = (laadt && t1.a_act > 0 && t1.volt > 0) ? (int32_t)t1.a_act * t1.volt * ph : 0;
+}
+
+void t1Poll() {
+  char path[96];
+  snprintf(path, sizeof(path), "/api/1/vehicles/%s/vehicle_data", t1_vin);
+  WiFiClient c;
+  bool chunked; uint32_t dl;
+  int code = t1Open(c, "GET", path, nullptr, TESLA_GET_TIMEOUT, chunked, dl);
+  bool okp = false;
+  if (code == 200) {
+    T1Body body(c, chunked, dl);
+    StaticJsonDocument<T1_FILTER_CAP> filter;
+    for (int i = 0; i < T1_NKEYS; i++) {       // geneste variant van de proxy-respons opvangen
+      filter["response"]["response"]["charge_state"][T1_KEYS[i]] = true;
+      filter["response"]["charge_state"][T1_KEYS[i]] = true;
+      filter["charge_state"][T1_KEYS[i]] = true;
+    }
+    StaticJsonDocument<T1_DOC_CAP> doc;
+    DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+    if (err) {
+      snprintf(t1.msg, sizeof(t1.msg), "JSON: %s", err.c_str());
+    } else {
+      JsonObject cs = doc["response"]["response"]["charge_state"].as<JsonObject>();
+      if (cs.isNull()) cs = doc["response"]["charge_state"].as<JsonObject>();
+      if (cs.isNull()) cs = doc["charge_state"].as<JsonObject>();
+      if (cs.isNull()) {
+        strlcpy(t1.msg, "geen laaddata (auto slaapt / BLE?)", sizeof(t1.msg));
+      } else {
+        t1Extract(cs);
+        okp = true;
+      }
+    }
+  } else if (code == 0) {
+    strlcpy(t1.msg, "proxy onbereikbaar", sizeof(t1.msg));
+  } else if (code < 0) {
+    strlcpy(t1.msg, "geen geldig antwoord (timeout)", sizeof(t1.msg));
+  } else {
+    snprintf(t1.msg, sizeof(t1.msg), "proxy HTTP %d", code);
+  }
+  c.stop();
+
+  t1.ok = okp;
+  uint32_t now = millis();
+  if (okp) {
+    t1.have = true; t1.last_ok_ms = now;
+    strlcpy(t1.msg, "OK", sizeof(t1.msg));
+    Serial.printf("[T1] SoC:%d%% %s %dA %ldW\n", t1.soc, t1.state, t1.a_act, (long)t1.pw);
+  } else {
+    Serial.printf("[T1] %s\n", t1.msg);
+  }
+  t1_next = now + (okp ? (t1Viewed(now) ? TESLA_POLL_VIEW_MS : TESLA_POLL_IDLE_MS)
+                       : TESLA_POLL_FAIL_MS);
+}
+
+void t1RunCmd() {
+  uint8_t id  = t1_cmd;
+  int     amp = t1_cmd_amps;
+  if (id < 1 || id > 4) { t1_cmd = 0; return; }
+  char path[100], body[32] = "", lbl[20];
+  snprintf(path, sizeof(path), "/api/1/vehicles/%s/command/%s", t1_vin, T1_CMD_PATH[id]);
+  if (id == 4) {
+    snprintf(body, sizeof(body), "{\"charging_amps\":%d}", amp);
+    snprintf(lbl, sizeof(lbl), "ampere %dA", amp);
+  } else {
+    strlcpy(lbl, T1_CMD_LABEL[id], sizeof(lbl));
+  }
+  WiFiClient c;
+  bool chunked; uint32_t dl;
+  int code = t1Open(c, "POST", path, body, TESLA_CMD_TIMEOUT, chunked, dl);
+  c.stop();
+  if (code == 200)     snprintf(t1.cmsg, sizeof(t1.cmsg), "%s: OK", lbl);
+  else if (code == 0)  snprintf(t1.cmsg, sizeof(t1.cmsg), "%s: proxy onbereikbaar", lbl);
+  else if (code < 0)   snprintf(t1.cmsg, sizeof(t1.cmsg), "%s: geen antwoord", lbl);
+  else                 snprintf(t1.cmsg, sizeof(t1.cmsg), "%s: HTTP %d", lbl, code);
+  Serial.printf("[T1] cmd %s\n", t1.cmsg);
+  t1_cmd  = 0;
+  t1_next = millis() + 2500UL;     // snel verversen om het effect te tonen
+}
+
+// ── Tesla1 endpoints ─────────────────────────────────────────
+void serveTeslaJson(AsyncWebServerRequest *req) {
+  uint32_t now = millis();
+  if (!t1Viewed(now)) t1_next = now;          // pagina net geopend → direct verversen
+  t1_last_view = now ? now : 1;
+  char buf[400];
+  snprintf(buf, sizeof(buf),
+    "{\"en\":%d,\"ok\":%d,\"age\":%ld,\"soc\":%d,\"us\":%d,\"lim\":%d,\"st\":\"%s\","
+    "\"a\":%d,\"ar\":%d,\"as\":%d,\"v\":%d,\"ph\":%d,\"pw\":%ld,\"pk\":%d,"
+    "\"e\":%.2f,\"m\":%d,\"r\":%.0f,\"p\":%d,\"maxa\":%d,\"busy\":%d,"
+    "\"msg\":\"%s\",\"cm\":\"%s\"}",
+    t1Enabled() ? 1 : 0, t1.ok ? 1 : 0,
+    t1.have ? (long)((now - t1.last_ok_ms) / 1000UL) : -1L,
+    t1.soc, t1.usable, t1.limit, t1.state,
+    t1.a_act, t1.a_req, t1.a_set, t1.volt, t1.phases, (long)t1.pw, t1.pk,
+    t1.energy, t1.mins, t1.range_km, t1.port, t1_maxa, t1_cmd ? 1 : 0,
+    t1.msg, t1.cmsg);
+  req->send(200, "application/json", buf);
+}
+
+void serveTeslaCfg(AsyncWebServerRequest *req) {
+  char buf[120];
+  snprintf(buf, sizeof(buf), "{\"host\":\"%s\",\"vin\":\"%s\",\"maxa\":%d}", t1_host, t1_vin, t1_maxa);
+  req->send(200, "application/json", buf);
+}
+
+void handleTeslaSave(AsyncWebServerRequest *req) {
+  auto ph = req->getParam("host");
+  auto pv = req->getParam("vin");
+  auto pm = req->getParam("maxa");
+  if (ph) { t1CopyClean(t1_host, sizeof(t1_host), ph->value().c_str(), false); prefs.putString(NVS_T_HOST, t1_host); }
+  if (pv) { t1CopyClean(t1_vin,  sizeof(t1_vin),  pv->value().c_str(), true);  prefs.putString(NVS_T_VIN,  t1_vin);  }
+  if (pm) {
+    int m = (int)pm->value().toInt();
+    t1_maxa = (uint8_t)constrain(m, TESLA_AMPS_MIN, TESLA_AMPS_CAP);
+    prefs.putUChar(NVS_T_MAXA, t1_maxa);
+  }
+  t1.ok = false; t1.have = false;
+  strlcpy(t1.msg, "instellingen gewijzigd", sizeof(t1.msg));
+  t1_next = millis();
+  req->send(200, "text/plain", "OK");
+}
+
+void handleTeslaCmd(AsyncWebServerRequest *req) {
+  if (!t1Enabled()) { req->send(200, "text/plain", "Tesla niet ingesteld"); return; }
+  auto pc = req->getParam("c");
+  if (!pc) { req->send(400, "text/plain", "geen commando"); return; }
+  if (t1_cmd) { req->send(200, "text/plain", "vorig commando nog bezig"); return; }
+  const String& c = pc->value();
+  uint8_t id = 0;
+  if      (c == "start") id = 1;
+  else if (c == "stop")  id = 2;
+  else if (c == "wake")  id = 3;
+  else if (c == "amps")  id = 4;
+  if (!id) { req->send(400, "text/plain", "onbekend commando"); return; }
+  if (id == 4) {
+    auto pa = req->getParam("a");
+    if (!pa) { req->send(400, "text/plain", "geen ampere"); return; }
+    int a = (int)pa->value().toInt();
+    t1_cmd_amps = (uint8_t)constrain(a, TESLA_AMPS_MIN, (int)t1_maxa);
+  }
+  t1_cmd = id;
+  req->send(200, "text/plain", "gepland");
+}
+
+const char T1_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Tesla1</title><style>
+body{font-family:Arial,sans-serif;margin:0;background:#f4f4f4;}
+.hdr{background:#ffcc00;padding:10px 15px;font-weight:bold;font-size:17px;display:flex;justify-content:space-between;align-items:center;}
+.nav{display:flex;flex-wrap:wrap;gap:5px;padding:7px 12px;background:#fff;border-bottom:2px solid #ddd;}
+.nav a{background:#369;color:#fff;padding:5px 11px;border-radius:4px;text-decoration:none;font-size:13px;}
+.nav a:hover{background:#036;}.nav a.act{background:#c00;}
+.banner{padding:9px 14px;margin:8px 14px;border-radius:6px;font-weight:bold;font-size:13px;text-align:center;background:#888;color:#fff;}
+.red{background:#c00;}.ok{background:#2a8a3e;}
+table{margin:8px 14px;border-collapse:collapse;width:calc(100% - 28px);max-width:500px;}
+td{padding:6px 8px;border-bottom:1px solid #ddd;font-size:14px;}
+td:first-child{font-weight:bold;color:#369;width:44%;}
+.box{margin:8px 14px;max-width:500px;}
+.btn{background:#369;color:#fff;padding:9px 16px;border:none;border-radius:5px;font-size:14px;cursor:pointer;margin:4px 6px 4px 0;}
+.btn:hover{background:#036;}.g{background:#2a8a3e;}.r{background:#c00;}
+input[type=text],input[type=number]{width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;font-size:14px;}
+input[type=range]{width:100%;}
+small{color:#666;}
+</style></head><body>
+<div class='hdr'><span>🚗 Tesla1</span><span id='ts' style='font-size:12px;font-weight:normal'></span></div>
+<div class='nav'><a href='/'>Status</a><a href='/json'>JSON</a><a href='/tesla' class='act'>Tesla</a><a href='/update'>OTA</a><a href='/settings'>Settings</a></div>
+<div id='ban' class='banner'>Laden…</div>
+<table>
+<tr><td>🔋 Batterij</td><td id='soc'>—</td></tr>
+<tr><td>Laadstatus</td><td id='st'>—</td></tr>
+<tr><td>Charge limit</td><td id='lim'>—</td></tr>
+<tr><td>Huidige A</td><td id='a'>—</td></tr>
+<tr><td>Ingesteld / gevraagd A</td><td id='ar'>—</td></tr>
+<tr><td>Vermogen</td><td id='pw'>—</td></tr>
+<tr><td>Spanning / fasen</td><td id='vph'>—</td></tr>
+<tr><td>Energie toegevoegd</td><td id='e'>—</td></tr>
+<tr><td>Tijd tot vol</td><td id='m'>—</td></tr>
+<tr><td>Range</td><td id='r'>—</td></tr>
+<tr><td>Laadpoort</td><td id='p'>—</td></tr>
+<tr><td>Data-leeftijd</td><td id='age'>—</td></tr>
+</table>
+<div class='box'>
+<button class='btn g' onclick="cmd('start','Laden starten?')">▶ Start</button>
+<button class='btn r' onclick="cmd('stop','Laden stoppen?')">■ Stop</button>
+<button class='btn' onclick="cmd('wake','')">☀ Wake-up</button><br><br>
+<b>Laadstroom: <span id='av'>16</span> A</b>
+<input type='range' id='sl' min='5' max='16' value='16' oninput="$('av').textContent=this.value">
+<button class='btn' onclick="cmd('amps&a='+$('sl').value,'')">Zet ampère</button>
+<div id='cmsg' style='font-size:12px;color:#666;margin-top:6px'></div>
+</div>
+<div class='box'><hr>
+<b>Instellingen</b> <small>(worden direct bewaard, geen reboot)</small>
+<table style='margin:6px 0;width:100%'>
+<tr><td>Proxy host / IP</td><td><input type='text' id='cfh' maxlength='39' placeholder='192.168.0.xx (leeg = Tesla uit)'></td></tr>
+<tr><td>VIN</td><td><input type='text' id='cfv' maxlength='17'></td></tr>
+<tr><td>Max ampère</td><td><input type='number' id='cfa' min='5' max='32'></td></tr>
+</table>
+<button class='btn' onclick='save()'>Opslaan</button>
+</div>
+<script>
+var $=function(i){return document.getElementById(i)},first=1,
+NL={Charging:'Laden',Stopped:'Gestopt',Complete:'Klaar',Disconnected:'Niet verbonden',NoPower:'Geen stroom',Starting:'Start…'};
+function n(v,d,u){return(v==null||v<0)?'—':v.toFixed(d)+u}
+function upd(){fetch('/tesla_json').then(function(r){return r.json()}).then(function(d){
+ var b=$('ban');
+ if(!d.en){b.className='banner red';b.textContent='Tesla niet ingesteld — vul host en VIN in';}
+ else if(!d.ok){b.className='banner red';b.textContent='⚠️ '+d.msg;}
+ else{b.className='banner ok';b.textContent='✅ Proxy OK';}
+ $('soc').textContent=n(d.soc,0,' %')+(d.us>=0?' (bruikbaar '+d.us+' %)':'');
+ $('st').textContent=d.st?(NL[d.st]||d.st):'—';
+ $('lim').textContent=n(d.lim,0,' %');
+ $('a').textContent=n(d.a,0,' A');
+ $('ar').textContent=n(d.as,0,' A')+' / '+n(d.ar,0,' A');
+ $('pw').textContent=(d.pw>0?(d.pw/1000).toFixed(1):'0')+' kW'+(d.pk>=0?' (auto meldt: '+d.pk+' kW)':'');
+ $('vph').textContent=n(d.v,0,' V')+' / '+(d.ph>0?d.ph:'—');
+ $('e').textContent=n(d.e,2,' kWh');
+ $('m').textContent=d.m>=0?Math.floor(d.m/60)+' u '+(d.m%60)+' min':'—';
+ $('r').textContent=n(d.r,0,' km');
+ $('p').textContent=d.p==1?'open':d.p==0?'dicht':'—';
+ $('age').textContent=d.age>=0?d.age+' s':'—';
+ $('cmsg').textContent=d.busy?'⏳ commando wordt uitgevoerd…':(d.cm?'Laatste commando: '+d.cm:'');
+ $('sl').max=d.maxa;
+ if(first&&d.as>=5&&d.as<=d.maxa){$('sl').value=d.as;$('av').textContent=d.as;first=0;}
+ $('ts').textContent=new Date().toLocaleTimeString('nl-BE');
+}).catch(function(){var b=$('ban');b.className='banner red';b.textContent='ESP niet bereikbaar';});}
+function cmd(c,q){
+ if(q&&!confirm(q))return;
+ fetch('/tesla_cmd?c='+c,{method:'POST'}).then(function(r){return r.text()}).then(function(t){
+  $('cmsg').textContent=t;setTimeout(upd,1500);});
+}
+function save(){
+ fetch('/tesla_save?host='+encodeURIComponent($('cfh').value.trim())+'&vin='+encodeURIComponent($('cfv').value.trim())+'&maxa='+encodeURIComponent($('cfa').value))
+ .then(function(){location.reload();});
+}
+fetch('/tesla_cfg').then(function(r){return r.json()}).then(function(c){
+ $('cfh').value=c.host;$('cfv').value=c.vin;$('cfa').value=c.maxa;$('sl').max=c.maxa;});
+upd();setInterval(upd,5000);
+</script></body></html>)rawliteral";
+
 // ── NVS OPSLAAN ─────────────────────────────────────────────
 void saveEnergy() {
   prefs.putFloat(NVS_SOL,  wh_sol);
@@ -498,16 +966,25 @@ void saveEnergy() {
 }
 
 // ── MIDNIGHT RESET ───────────────────────────────────────────
+// v1.28: elke 5s-tick aangeroepen; dag (YYYYMMDD) staat in NVS zodat ook een reboot
+// over middernacht heen correct resetten. Blokkeert niet als NTP nog niet sync is.
 void checkMidnight() {
-  struct tm ti;
-  if (!getLocalTime(&ti, 500)) return;
-  if (ti.tm_mday == last_mday || ti.tm_hour != 0 || ti.tm_min > 2) return;
-  last_mday = ti.tm_mday;
+  time_t t = time(nullptr);
+  if (t < 1700000000L) return;                       // NTP nog niet gesynchroniseerd
+  struct tm ti; localtime_r(&t, &ti);
+  int32_t today = (ti.tm_year + 1900) * 10000 + (ti.tm_mon + 1) * 100 + ti.tm_mday;
+  if (last_day < 0) {                                // eerste start met v1.28: dag onthouden, niets wissen
+    last_day = today; prefs.putInt(NVS_DAY, last_day); return;
+  }
+  if (today == last_day) return;
+  bool nieuwe_maand = (today / 100 != last_day / 100);
+  last_day = today;
   wh_sol = wh_schf = wh_schr = 0;
   wh_won_imp = wh_won_exp = 0;
-  if (ti.tm_mday == 1) piek_w = 0;
+  if (nieuwe_maand) piek_w = 0;
+  prefs.putInt(NVS_DAY, last_day);
   saveEnergy();
-  Serial.printf("[RESET] Dag %d/%d\n", ti.tm_mday, ti.tm_mon + 1);
+  Serial.printf("[RESET] Dag %d/%d%s\n", ti.tm_mday, ti.tm_mon + 1, nieuwe_maand ? " (nieuwe maand: piek reset)" : "");
 }
 
 // ── SERIAL COMMANDO'S ────────────────────────────────────────
@@ -525,6 +1002,8 @@ void handleSerialCommands() {
     Serial.printf("SIM_S0: %s  SIM_P1: %s  P1_IP: %s\n",
       SIM_S0 ? "AAN" : "UIT", SIM_P1 ? "AAN" : "UIT",
       strlen(p1_ip) > 0 ? p1_ip : "(niet ingesteld)");
+    Serial.printf("Tesla1: %s host=%s ok=%d SoC=%d%% %s %dA msg=%s\n",
+      t1Enabled() ? "AAN" : "UIT", t1_host, t1.ok ? 1 : 0, t1.soc, t1.state, t1.a_act, t1.msg);
 
   // S0 simulatie — BEWUST handmatig omschakelen
   } else if (cmd.equalsIgnoreCase("sim s0 on")) {
@@ -626,7 +1105,7 @@ void serveStatus(AsyncWebServerRequest *req) {
     "<div class='hdr'><span>" CTRL_ID " v" FW_VERSION "</span>"
     "<span id='ts' style='font-size:12px;font-weight:normal'></span></div>"
     "<div class='nav'>"
-    "<a href='/' class='act'>Status</a><a href='/json'>JSON</a>"
+    "<a href='/' class='act'>Status</a><a href='/json'>JSON</a><a href='/tesla'>Tesla</a>"
     "<a href='/update'>OTA</a><a href='/settings'>Settings</a>"
     "</div>"));
 
@@ -715,7 +1194,7 @@ void serveSettings(AsyncWebServerRequest *req) {
     "</style></head><body>"
     "<div class='hdr'>S-ENERGY v" FW_VERSION " Settings</div>"
     "<div class='nav'>"
-    "<a href='/'>Status</a><a href='/json'>JSON</a>"
+    "<a href='/'>Status</a><a href='/json'>JSON</a><a href='/tesla'>Tesla</a>"
     "<a href='/update'>OTA</a><a href='/settings' class='act'>Settings</a>"
     "</div><div class='form'>"
     "<form action='/save_settings' method='get' id='sf'><table>"));
@@ -816,7 +1295,7 @@ void serveOTA(AsyncWebServerRequest *req) {
     ".btn:hover{background:#036;}.btn-red{background:#c00;}"
     "</style></head><body>"
     "<div class='hdr'>OTA Firmware Update</div>"
-    "<div class='nav'><a href='/'>Status</a><a href='/json'>JSON</a>"
+    "<div class='nav'><a href='/'>Status</a><a href='/json'>JSON</a><a href='/tesla'>Tesla</a>"
     "<a href='/update' class='act'>OTA</a><a href='/settings'>Settings</a>"
     "</div><div class='main'>"
     "<form method='POST' action='/update' enctype='multipart/form-data'>"
@@ -865,7 +1344,7 @@ void startWiFi() {
     }
     if (WiFi.status() == WL_CONNECTED) {
       Serial.println("\nVerbonden: " + WiFi.localIP().toString());
-      ap_mode = false; configTime(TZ_SEC, 3600, NTP_SRV); return;
+      ap_mode = false; configTzTime(TZ_INFO, NTP_SRV); return;
     }
   }
 start_ap:
@@ -894,6 +1373,10 @@ void setup() {
   strlcpy(wifi_pass,  prefs.getString(NVS_PASS, DEF_PASS).c_str(), sizeof(wifi_pass));
   strlcpy(static_ip,  prefs.getString(NVS_IP,   DEF_IP).c_str(),   sizeof(static_ip));
   strlcpy(p1_ip,      prefs.getString(NVS_P1_IP, "").c_str(),       sizeof(p1_ip));
+  last_day   = prefs.getInt(NVS_DAY, -1);
+  prefs.getString(NVS_T_HOST, t1_host, sizeof(t1_host));
+  prefs.getString(NVS_T_VIN,  t1_vin,  sizeof(t1_vin));
+  t1_maxa    = (uint8_t)constrain((int)prefs.getUChar(NVS_T_MAXA, DEF_TESLA_MAXA), TESLA_AMPS_MIN, TESLA_AMPS_CAP);
   uint8_t bri = prefs.getUChar(NVS_BRI, DEF_BRIGHT);
 
   Serial.printf("[NVS] Sol:%.0f SchF:%.0f SchR:%.0f Piek:%.0fW\n",
@@ -920,6 +1403,11 @@ void setup() {
   server.on("/json",     HTTP_GET, serveJson);
   server.on("/update",   HTTP_GET, serveOTA);
   server.on("/settings", HTTP_GET, serveSettings);
+  server.on("/tesla",      HTTP_GET,  [](AsyncWebServerRequest *req) { req->send_P(200, "text/html", T1_HTML); });
+  server.on("/tesla_json", HTTP_GET,  serveTeslaJson);
+  server.on("/tesla_cfg",  HTTP_GET,  serveTeslaCfg);
+  server.on("/tesla_save", HTTP_GET,  handleTeslaSave);
+  server.on("/tesla_cmd",  HTTP_POST, handleTeslaCmd);
 
   server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *req) {
     if (req->hasArg("ssid")) { strlcpy(wifi_ssid, req->arg("ssid").c_str(), sizeof(wifi_ssid)); prefs.putString(NVS_SSID, wifi_ssid); }
@@ -983,6 +1471,8 @@ void setup() {
   server.begin();
   fetchEpex();
   t_epex = t_15m = t_p1 = millis();
+  t1_next = millis() + 5000UL;
+  Serial.printf("[T1] %s host=%s maxA=%d\n", t1Enabled() ? "AAN" : "UIT (host/VIN leeg)", t1_host, t1_maxa);
 
   Serial.printf("[HEAP] %d bytes  %dKB largest\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap()/1024);
   Serial.printf("HTTP: http://%s\n",
@@ -1008,6 +1498,7 @@ void loop() {
   // ── 5s tick ──────────────────────────────────────────────
   if (now - t_5s >= 5000) {
     t_5s = now;
+    checkMidnight();
 
     // S0 kanalen: simulatie OF live — nooit automatisch
     if (SIM_S0) simTickS0();
@@ -1027,11 +1518,10 @@ void loop() {
       epex_nu, ESP.getMaxAllocHeap() / 1024);
   }
 
-  // ── 15 min: NVS + midnight check ─────────────────────────
+  // ── 15 min: NVS opslaan ──────────────────────────────────
   if (now - t_15m >= 900000UL) {
     t_15m = now;
     saveEnergy();
-    checkMidnight();
   }
 
   // ── 15 min: EPEX herladen ────────────────────────────────
@@ -1039,10 +1529,10 @@ void loop() {
     t_epex = now;
     fetchEpex();
   }
-}
 
-// ── TODO v1.27 ───────────────────────────────────────────────
-// - ntfy.sh push bij piekdrempel overschreden
-// - Automatische zomertijd via NTP DST
-// - Vaste opslag ophalen via /api/settings (nu hardcoded VAST_CT_KWH)
-// - WON individuele piek bijhouden (key pw) zodra P1-dongle actief
+  // ── Tesla1: commando of poll (blokkerend met deadline) ────
+  if (t1Enabled() && WiFi.status() == WL_CONNECTED) {
+    if (t1_cmd) t1RunCmd();
+    else if ((int32_t)(now - t1_next) >= 0) t1Poll();
+  }
+}
