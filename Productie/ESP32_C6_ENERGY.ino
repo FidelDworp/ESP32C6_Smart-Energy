@@ -1,5 +1,5 @@
-// ESP32_C6_ENERGY_v1_28.ino — Zarlar Smart Energy Controller
-// Developed by Filip Delannoy, april 2026.
+// ESP32_C6_ENERGY_v1_29.ino — Zarlar Smart Energy Controller
+// Developed by Filip Delannoy, april 2026 / herziening sep 2026.
 // Bereikbaar op http://192.168.0.73
 //
 // PARTITIETABEL: Compileer met "partitions_16mb.csv" in de schetsmap
@@ -10,13 +10,13 @@
 //   spiffs,  data, spiffs,0xC10000, 0x3F0000,
 //
 // ── VERSIEHISTORIE ──────────────────────────────────────────
+// 24sep26 v1.29 Heap/robustheid: P1+EPEX zonder http.getString(); P1 midnight-snapshot
+//               reset bij dagwissel; /tesla_json escape msg/cmsg; serial zonder String;
+//               max_piek default consistent 15 kW. Tesla-gedrag ongewijzigd.
 // 24sep26 v1.28 Tesla1: pagina /tesla — data volgen + handmatig start/stop/wake/ampère
-//               via proxy tesla-key-esp32 (BLE). Eigen minimale HTTP-client (geen
-//               HTTPClient/String), stream-parse met ArduinoJson-filter. Geen auto-sturing.
-//               Fix: middernacht-reset elke 5s-tick + dag in NVS (was 3-minutenvenster
-//               in het 15-min-blok, ~1 op 5 kans).
-//               Fix: automatische zomertijd (configTzTime CET/CEST) i.p.v. vaste UTC+2.
-//               TODO-blok onderaan verplaatst naar OPENSTAAND hieronder.
+//               via proxy tesla-key-esp32 (BLE). Eigen minimale HTTP-client,
+//               stream-parse met ArduinoJson-filter. Geen auto-sturing.
+//               Fix: middernacht-reset elke 5s-tick + dag in NVS; configTzTime CET/CEST.
 // 28apr26 v1.27 Matrix layout definitief (EPEX-label 27 april)
 // 25apr26 v1.26 Twee onafhankelijke simulatievlaggen (SIM_S0 / SIM_P1)
 // 25apr26 v1.25 Enkelvoudige SIMULATION_MODE (archief)
@@ -25,8 +25,6 @@
 // ── OPENSTAAND ──────────────────────────────────────────────
 //  - ntfy.sh push bij piekdrempel overschreden
 //  - Vaste opslag ophalen via /api/settings (nu hardcoded VAST_CT_KWH)
-//  - fetchP1(): imp_midnight/exp_midnight-snapshot wordt niet bij middernacht vernieuwd
-//    -> WON-dagwaarden lopen op in LIVE-modus (relevant vanaf ~2028)
 //  - piek_w is momentaan en enkel SCH (geen WON, geen kwartiergemiddelde)
 //  - WON individuele piek bijhouden (key pw) zodra P1-dongle actief
 //  - Tesla1 later: solar->tesla1 dag/totaal-tellers, t1_-keys in /json (+ GAS/Dashboard),
@@ -83,9 +81,10 @@
 #include <Adafruit_NeoPixel.h>
 #include <time.h>
 #include <math.h>
+#include <strings.h>   // strcasecmp (serial-commando's)
 
 // ── VERSIE ──────────────────────────────────────────────────
-#define FW_VERSION   "1.28"
+#define FW_VERSION   "1.29"
 #define CTRL_ID      "S-ENERGY"
 #define NVS_NS       "senrg"
 
@@ -189,7 +188,9 @@ float    piek_w  = 0;
 float    w_won        = 0;   // W momentaan (+ = afname, − = injectie)
 float    wh_won_imp   = 0;   // Wh dag afname WON
 float    wh_won_exp   = 0;   // Wh dag injectie WON
-// NB: dagcumulatieven WON worden berekend als delta tov NVS-snapshot bij midnight
+// Snapshot cumulatieve P1-tellers bij middernacht (of eerste meting na boot)
+float    p1_imp_midnight = -1.0f;
+float    p1_exp_midnight = -1.0f;
 
 // ── EPEX ─────────────────────────────────────────────────────
 float    epex_nu = 0, epex_p1h = 0;  // all-in ct/kWh
@@ -445,44 +446,44 @@ void liveTickS0() {
 // NB: total_power_*_kwh zijn CUMULATIEVE tellers (niet dag-reset).
 //     Dagcumulatief = huidige waarde − snapshot bij midnight (zie checkMidnight)
 void fetchP1() {
-  if (SIM_P1) return;               // simulatie actief — niet ophalen
-  if (strlen(p1_ip) == 0) return;   // geen IP ingesteld
+  if (SIM_P1) return;
+  if (strlen(p1_ip) == 0) return;
   if (WiFi.status() != WL_CONNECTED) return;
+
+  char url[48];
+  snprintf(url, sizeof(url), "http://%s/api/v1/data", p1_ip);
 
   HTTPClient http;
   http.setTimeout(4000);
-  String url = "http://";
-  url += p1_ip;
-  url += "/api/v1/data";
   http.begin(url);
   int code = http.GET();
   if (code != 200) {
     Serial.printf("[P1] HTTP fout: %d\n", code);
-    http.end(); return;
+    http.end();
+    return;
   }
 
-  // Minimale JsonDocument — alleen de keys die wij nodig hebben
-  StaticJsonDocument<512> doc;
-  DeserializationError err = deserializeJson(doc, http.getString());
+  // Stream i.p.v. getString() — vermijdt grote tijdelijke String op de heap
+  StaticJsonDocument<384> doc;
+  DeserializationError err = deserializeJson(doc, http.getStream());
   http.end();
   if (err) { Serial.println(F("[P1] JSON fout")); return; }
 
-  // active_power_w: positief = afname, negatief = injectie (DSMR convention)
   float pwr = doc["active_power_w"] | 0.0f;
-  w_won = pwr;  // positief = afname WON, negatief = injectie WON
+  w_won = pwr;
 
-  // Dag-cumulatieven via cumulatieve tellers (delta tov midnight snapshot — zie checkMidnight)
   float imp = (doc["total_power_import_t1_kwh"] | 0.0f)
             + (doc["total_power_import_t2_kwh"] | 0.0f);
   float exp = (doc["total_power_export_t1_kwh"] | 0.0f)
             + (doc["total_power_export_t2_kwh"] | 0.0f);
 
-  // wh_won_imp/exp zijn dag-cumulatieven bijgehouden als delta tov midnight
-  // (worden gereset in checkMidnight via NVS snapshot)
-  static float imp_midnight = -1, exp_midnight = -1;
-  if (imp_midnight < 0) { imp_midnight = imp; exp_midnight = exp; }  // eerste meting na boot
-  wh_won_imp = (imp - imp_midnight) * 1000.0f;  // kWh → Wh
-  wh_won_exp = (exp - exp_midnight) * 1000.0f;
+  // Globale midnight-snapshot (reset in checkMidnight)
+  if (p1_imp_midnight < 0) {
+    p1_imp_midnight = imp;
+    p1_exp_midnight = exp;
+  }
+  wh_won_imp = (imp - p1_imp_midnight) * 1000.0f;
+  wh_won_exp = (exp - p1_exp_midnight) * 1000.0f;
 
   Serial.printf("[P1] %.0fW  imp:%.3f exp:%.3f kWh\n", pwr,
     wh_won_imp / 1000.0f, wh_won_exp / 1000.0f);
@@ -491,13 +492,26 @@ void fetchP1() {
 // ── EPEX OPHALEN VIA RPI ─────────────────────────────────────
 void fetchEpex() {
   if (WiFi.status() != WL_CONNECTED) return;
+
+  char url[64];
+  snprintf(url, sizeof(url), "%s/api/epex", RPI_BASE);
+
   HTTPClient http;
   http.setTimeout(6000);
-  http.begin(String(RPI_BASE) + "/api/epex");
+  http.begin(url);
   int code = http.GET();
-  if (code != 200) { Serial.printf("[EPEX] HTTP fout: %d\n", code); http.end(); return; }
-  DynamicJsonDocument doc(4096);
-  DeserializationError err = deserializeJson(doc, http.getString());
+  if (code != 200) {
+    Serial.printf("[EPEX] HTTP fout: %d\n", code);
+    http.end();
+    return;
+  }
+
+  // Stream + filter: alleen de twee arrays die we nodig hebben
+  StaticJsonDocument<192> filter;
+  filter["unix_seconds"] = true;
+  filter["price"] = true;
+  DynamicJsonDocument doc(3072);
+  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   http.end();
   if (err) { Serial.println(F("[EPEX] JSON fout")); return; }
 
@@ -796,11 +810,33 @@ void t1RunCmd() {
 }
 
 // ── Tesla1 endpoints ─────────────────────────────────────────
+// Escapet " en \ voor veilige JSON-strings (vaste buffer)
+static void t1JsonEsc(char* dst, size_t cap, const char* src) {
+  size_t n = 0;
+  if (!src) { if (cap) dst[0] = 0; return; }
+  for (; *src && n + 2 < cap; ++src) {
+    char ch = *src;
+    if (ch == '"' || ch == '\\') {
+      if (n + 3 >= cap) break;
+      dst[n++] = '\\';
+      dst[n++] = ch;
+    } else if ((unsigned char)ch < 0x20) {
+      continue;
+    } else {
+      dst[n++] = ch;
+    }
+  }
+  dst[n] = 0;
+}
+
 void serveTeslaJson(AsyncWebServerRequest *req) {
   uint32_t now = millis();
-  if (!t1Viewed(now)) t1_next = now;          // pagina net geopend → direct verversen
+  if (!t1Viewed(now)) t1_next = now;
   t1_last_view = now ? now : 1;
-  char buf[400];
+  char emsg[48], ecmsg[48];
+  t1JsonEsc(emsg, sizeof(emsg), t1.msg);
+  t1JsonEsc(ecmsg, sizeof(ecmsg), t1.cmsg);
+  char buf[440];
   snprintf(buf, sizeof(buf),
     "{\"en\":%d,\"ok\":%d,\"age\":%ld,\"soc\":%d,\"us\":%d,\"lim\":%d,\"st\":\"%s\","
     "\"a\":%d,\"ar\":%d,\"as\":%d,\"v\":%d,\"ph\":%d,\"pw\":%ld,\"pk\":%d,"
@@ -811,7 +847,7 @@ void serveTeslaJson(AsyncWebServerRequest *req) {
     t1.soc, t1.usable, t1.limit, t1.state,
     t1.a_act, t1.a_req, t1.a_set, t1.volt, t1.phases, (long)t1.pw, t1.pk,
     t1.energy, t1.mins, t1.range_km, t1.port, t1_maxa, t1_cmd ? 1 : 0,
-    t1.msg, t1.cmsg);
+    emsg, ecmsg);
   req->send(200, "application/json", buf);
 }
 
@@ -981,6 +1017,9 @@ void checkMidnight() {
   last_day = today;
   wh_sol = wh_schf = wh_schr = 0;
   wh_won_imp = wh_won_exp = 0;
+  // Volgende P1-poll zet nieuwe midnight-baseline (anders lopen dagwaarden op)
+  p1_imp_midnight = -1.0f;
+  p1_exp_midnight = -1.0f;
   if (nieuwe_maand) piek_w = 0;
   prefs.putInt(NVS_DAY, last_day);
   saveEnergy();
@@ -990,11 +1029,23 @@ void checkMidnight() {
 // ── SERIAL COMMANDO'S ────────────────────────────────────────
 void handleSerialCommands() {
   if (!Serial.available()) return;
-  String cmd = Serial.readStringUntil('\n'); cmd.trim();
+  char cmd[48];
+  size_t n = 0;
+  while (Serial.available() && n + 1 < sizeof(cmd)) {
+    char ch = (char)Serial.read();
+    if (ch == '\n' || ch == '\r') break;
+    cmd[n++] = ch;
+  }
+  cmd[n] = 0;
+  // trim leading/trailing spaces
+  while (n && (cmd[n - 1] == ' ' || cmd[n - 1] == '\t')) cmd[--n] = 0;
+  char* p = cmd;
+  while (*p == ' ' || *p == '\t') ++p;
+  if (!*p) return;
 
-  if (cmd.equalsIgnoreCase("reset_nvs")) {
+  if (!strcasecmp(p, "reset_nvs")) {
     prefs.clear(); delay(200); ESP.restart();
-  } else if (cmd.equalsIgnoreCase("status")) {
+  } else if (!strcasecmp(p, "status")) {
     Serial.printf("Sol:%.0fW SchF:%.0fW SchR:%.0fW Netto:%.0fW WON:%.0fW EPEX:%.1fct\n",
       w_sol, w_schf, w_schr, w_netto, w_won, epex_nu);
     Serial.printf("Dag: Sol:%.0f SchF:%.0f SchR:%.0f WON-imp:%.0f WON-exp:%.0f Piek:%.0fW\n",
@@ -1004,27 +1055,21 @@ void handleSerialCommands() {
       strlen(p1_ip) > 0 ? p1_ip : "(niet ingesteld)");
     Serial.printf("Tesla1: %s host=%s ok=%d SoC=%d%% %s %dA msg=%s\n",
       t1Enabled() ? "AAN" : "UIT", t1_host, t1.ok ? 1 : 0, t1.soc, t1.state, t1.a_act, t1.msg);
-
-  // S0 simulatie — BEWUST handmatig omschakelen
-  } else if (cmd.equalsIgnoreCase("sim s0 on")) {
+  } else if (!strcasecmp(p, "sim s0 on")) {
     SIM_S0 = true;  prefs.putBool(NVS_SIM_S0, true);
     Serial.println(F("[SIM_S0] AAN — S0 pulsen worden gesimuleerd"));
-  } else if (cmd.equalsIgnoreCase("sim s0 off")) {
+  } else if (!strcasecmp(p, "sim s0 off")) {
     SIM_S0 = false; prefs.putBool(NVS_SIM_S0, false);
     Serial.println(F("[SIM_S0] UIT — live S0 ISR actief ⚠️  Controleer bekabeling!"));
-
-  // P1 simulatie — BEWUST handmatig omschakelen
-  } else if (cmd.equalsIgnoreCase("sim p1 on")) {
+  } else if (!strcasecmp(p, "sim p1 on")) {
     SIM_P1 = true;  prefs.putBool(NVS_SIM_P1, true);
     Serial.println(F("[SIM_P1] AAN — P1 dongle wordt gesimuleerd"));
-  } else if (cmd.equalsIgnoreCase("sim p1 off")) {
+  } else if (!strcasecmp(p, "sim p1 off")) {
     SIM_P1 = false; prefs.putBool(NVS_SIM_P1, false);
     Serial.printf("[SIM_P1] UIT — live HomeWizard P1 actief (IP: %s)\n",
       strlen(p1_ip) > 0 ? p1_ip : "⚠️  NIET INGESTELD!");
-
-  } else if (cmd.equalsIgnoreCase("help")) {
-    Serial.println(F("Commando's: status | reset_nvs | "
-      "sim s0 on/off | sim p1 on/off"));
+  } else if (!strcasecmp(p, "help")) {
+    Serial.println(F("Commando's: status | reset_nvs | sim s0 on/off | sim p1 on/off"));
   }
 }
 
@@ -1366,7 +1411,7 @@ void setup() {
   wh_schf    = prefs.getFloat(NVS_SCHF, 0.0f);
   wh_schr    = prefs.getFloat(NVS_SCHR, 0.0f);
   piek_w     = prefs.getFloat(NVS_PIEK, 0.0f);
-  max_piek_w = prefs.getUInt(NVS_MPIEK, 10000);
+  max_piek_w = prefs.getUInt(NVS_MPIEK, 15000);  // default 15 kW (gelijk aan global)
   SIM_S0     = prefs.getBool(NVS_SIM_S0, true);   // default: simulatie AAN
   SIM_P1     = prefs.getBool(NVS_SIM_P1, true);   // default: simulatie AAN
   strlcpy(wifi_ssid,  prefs.getString(NVS_SSID, DEF_SSID).c_str(), sizeof(wifi_ssid));
