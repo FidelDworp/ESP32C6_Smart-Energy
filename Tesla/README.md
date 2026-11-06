@@ -42,7 +42,7 @@ Verbind met het open netwerk tesla-key-esp32-setup.
 Wacht op de automatische webpage (Of ga naar http://192.168.4.1) en vul je WiFi + 17-cijferige VIN in.
 
 => Apparaat herstart en komt op je netwerk als http://tesla-key-esp32.local/
-Opm: In Zarlardinge kreeg deze controller IP: 192.168.0.134
+Opm: In Zarlardinge kreeg deze controller IP: 192.168.0.134 (van de router, kan wijzigen). Daarom vul je in S-ENERGY (vanaf v1.30) als host de naam `tesla-key-esp32.local` in, niet het IP.
 
 4. Pairen met de auto
 Zet de ESP32 dicht bij de auto (binnen ~10 m).

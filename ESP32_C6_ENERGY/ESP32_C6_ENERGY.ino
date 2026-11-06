@@ -1,6 +1,6 @@
-// ESP32_C6_ENERGY_v1_29.ino — Zarlar Smart Energy Controller
+// ESP32_C6_ENERGY_v1_30.ino — Zarlar Smart Energy Controller
 // Developed by Filip Delannoy, april 2026 / herziening sep 2026.
-// Bereikbaar op http://192.168.0.73
+// Bereikbaar op http://192.168.0.73 of http://smart-energy.local (v1.30)
 //
 // PARTITIETABEL: Compileer met "partitions_16mb.csv" in de schetsmap
 //   nvs,     data, nvs,   0x9000,   0x5000,
@@ -10,6 +10,12 @@
 //   spiffs,  data, spiffs,0xC10000, 0x3F0000,
 //
 // ── VERSIEHISTORIE ──────────────────────────────────────────
+// 06nov26 v1.30 Tesla-proxy op naam: host mag 'tesla-key-esp32.local' zijn. S-ENERGY zoekt
+//               het adres via mDNS, onthoudt het (RAM + NVS t1_lastip) en zoekt opnieuw als
+//               een verbinding mislukt (max 1x/min, max 2 s). Een IP als host werkt zoals
+//               voorheen. Eigen mDNS-naam smart-energy.local. /tesla toont het gevonden
+//               adres; /tesla_json + ip/ipn/ipa achteraan. Serieel: tesla-resolve.
+//               /json ongewijzigd.
 // 24sep26 v1.29 Heap/robustheid: P1+EPEX zonder http.getString(); P1 midnight-snapshot
 //               reset bij dagwissel; /tesla_json escape msg/cmsg; serial zonder String;
 //               max_piek default consistent 15 kW. Tesla-gedrag ongewijzigd.
@@ -77,6 +83,7 @@
 #include <Update.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
+#include <ESPmDNS.h>     // v1.30: eigen naam + Tesla-proxy opzoeken
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
 #include <time.h>
@@ -84,9 +91,10 @@
 #include <strings.h>   // strcasecmp (serial-commando's)
 
 // ── VERSIE ──────────────────────────────────────────────────
-#define FW_VERSION   "1.29"
+#define FW_VERSION   "1.30"
 #define CTRL_ID      "S-ENERGY"
 #define NVS_NS       "senrg"
+#define MDNS_NAME    "smart-energy"   // v1.30: http://smart-energy.local
 
 // ── PINS ────────────────────────────────────────────────────
 #define S0_SOL_PIN    5
@@ -138,6 +146,8 @@ const char* NTP_SRV   = "pool.ntp.org";
 #define TESLA_AMPS_MIN           5
 #define TESLA_AMPS_CAP          32      // harde bovengrens voor de instelling
 #define DEF_TESLA_MAXA          16
+#define T1_RESOLVE_MIN_MS    60000UL    // v1.30: hoogstens 1 mDNS-opzoeking per minuut
+#define T1_RESOLVE_TO_MS      2000UL    // v1.30: maximale wachttijd per opzoeking
 
 // ── NVS KEYS ────────────────────────────────────────────────
 const char* NVS_SSID     = "wifi_ssid";
@@ -156,6 +166,7 @@ const char* NVS_DAY      = "last_day"; // int — laatst verwerkte dag (YYYYMMDD
 const char* NVS_T_HOST   = "t1_host";  // string — tesla-key-esp32 host/IP
 const char* NVS_T_VIN    = "t1_vin";   // string — VIN
 const char* NVS_T_MAXA   = "t1_maxa";  // uchar — max laadstroom (A)
+const char* NVS_T_LASTIP = "t1_lastip";// string — v1.30: laatst via mDNS gevonden adres
 
 // ── OBJECTEN ────────────────────────────────────────────────
 AsyncWebServer    server(80);
@@ -579,6 +590,65 @@ volatile uint8_t  t1_cmd_amps  = 0;
 volatile uint32_t t1_last_view = 0;    // laatste keer dat /tesla_json werd opgevraagd
 uint32_t          t1_next      = 0;    // volgende poll (millis)
 
+// v1.30: proxy op naam (mDNS) — adres onthouden, opnieuw zoeken bij een mislukte verbinding
+IPAddress t1_ip;                   // gekend adres van de proxy (0.0.0.0 = onbekend)
+bool      t1_ip_named   = false;   // adres komt uit een mDNS-opzoeking (of de cache daarvan)
+bool      t1_ip_stale   = false;   // laatste verbinding mislukt → eerst opnieuw zoeken
+uint32_t  t1_resolve_ms = 0;       // laatste zoekpoging (millis, 0 = nog nooit)
+uint32_t  t1_found_ms   = 0;       // laatste geslaagde opzoeking (millis, 0 = nog nooit)
+
+bool t1IpSet() { return (t1_ip[0] | t1_ip[1] | t1_ip[2] | t1_ip[3]) != 0; }
+
+// Host eindigt op ".local" → opzoeken via mDNS
+bool t1HostIsName() {
+  size_t n = strlen(t1_host);
+  return n > 6 && strcasecmp(t1_host + n - 6, ".local") == 0;
+}
+
+// Beginwaarde van t1_ip na opstarten of na een nieuwe host.
+// use_cache: het in NVS bewaarde adres gebruiken (alleen bij opstarten).
+void t1InitIp(bool use_cache) {
+  IPAddress ip;
+  t1_ip = IPAddress(); t1_ip_named = false; t1_ip_stale = false;
+  t1_resolve_ms = 0; t1_found_ms = 0;
+  if (ip.fromString(t1_host)) { t1_ip = ip; return; }   // host is een IP: zoals voor v1.30
+  if (!t1HostIsName()) return;                          // andere naam: connect() lost hem zelf op
+  if (use_cache) {
+    char lip[16] = "";
+    prefs.getString(NVS_T_LASTIP, lip, sizeof(lip));
+    if (ip.fromString(lip)) { t1_ip = ip; t1_ip_named = true; return; }
+  }
+  t1_ip_stale = true;                                   // geen gekend adres → eerst zoeken
+}
+
+// Zoekt de proxy op via mDNS. Blokkeert hoogstens T1_RESOLVE_TO_MS.
+// force = de 1x/min-grens negeren (opstarten, serieel commando).
+// Return: er is (nog) een bruikbaar adres.
+bool t1Resolve(bool force) {
+  if (!t1HostIsName()) return t1IpSet();
+  uint32_t now = millis();
+  if (!force && t1_resolve_ms && (uint32_t)(now - t1_resolve_ms) < T1_RESOLVE_MIN_MS) return t1IpSet();
+  t1_resolve_ms = now ? now : 1;
+  char name[40];
+  strlcpy(name, t1_host, sizeof(name));
+  name[strlen(name) - 6] = 0;                          // ".local" eraf
+  IPAddress f = MDNS.queryHost(name, T1_RESOLVE_TO_MS);
+  if ((f[0] | f[1] | f[2] | f[3]) == 0) {
+    Serial.printf("[T1] mDNS: %s niet gevonden (blijft %s)\n", t1_host,
+                  t1IpSet() ? t1_ip.toString().c_str() : "onbekend");
+    return t1IpSet();
+  }
+  if (!(f == t1_ip)) {
+    prefs.putString(NVS_T_LASTIP, f.toString().c_str());
+    Serial.printf("[T1] mDNS: %s = %s (nieuw adres)\n", t1_host, f.toString().c_str());
+  } else {
+    Serial.printf("[T1] mDNS: %s = %s\n", t1_host, f.toString().c_str());
+  }
+  t1_ip = f; t1_ip_named = true; t1_ip_stale = false;
+  t1_found_ms = now ? now : 1;
+  return true;
+}
+
 bool t1Enabled() { return !ap_mode && t1_host[0] && t1_vin[0]; }
 bool t1Viewed(uint32_t now) { return t1_last_view && (uint32_t)(now - t1_last_view) < 120000UL; }
 
@@ -683,7 +753,15 @@ int t1Open(WiFiClient& c, const char* method, const char* path, const char* body
            uint32_t to_ms, bool& chunked, uint32_t& dl) {
   chunked = false;
   dl = millis() + to_ms;
-  if (!c.connect(t1_host, 80, 1500)) return 0;
+  // v1.30: verbinden met het gekende adres; bij een naam eerst opzoeken als dat nodig is
+  if (t1HostIsName() && (!t1IpSet() || t1_ip_stale)) t1Resolve(false);
+  bool con = t1IpSet() ? c.connect(t1_ip, 80, 1500) : c.connect(t1_host, 80, 1500);
+  if (!con && t1HostIsName()) {
+    IPAddress oud = t1_ip;
+    t1_ip_stale = true;                                 // proxy kan een nieuw adres hebben
+    if (t1Resolve(false) && !(t1_ip == oud)) con = c.connect(t1_ip, 80, 1500);
+  }
+  if (!con) return 0;
 
   char hdr[72] = "";
   if (body) snprintf(hdr, sizeof(hdr), "Content-Type: application/json\r\nContent-Length: %d\r\n", (int)strlen(body));
@@ -836,18 +914,21 @@ void serveTeslaJson(AsyncWebServerRequest *req) {
   char emsg[48], ecmsg[48];
   t1JsonEsc(emsg, sizeof(emsg), t1.msg);
   t1JsonEsc(ecmsg, sizeof(ecmsg), t1.cmsg);
-  char buf[440];
+  char buf[512];
   snprintf(buf, sizeof(buf),
     "{\"en\":%d,\"ok\":%d,\"age\":%ld,\"soc\":%d,\"us\":%d,\"lim\":%d,\"st\":\"%s\","
     "\"a\":%d,\"ar\":%d,\"as\":%d,\"v\":%d,\"ph\":%d,\"pw\":%ld,\"pk\":%d,"
     "\"e\":%.2f,\"m\":%d,\"r\":%.0f,\"p\":%d,\"maxa\":%d,\"busy\":%d,"
-    "\"msg\":\"%s\",\"cm\":\"%s\"}",
+    "\"msg\":\"%s\",\"cm\":\"%s\","
+    "\"ip\":\"%s\",\"ipn\":%d,\"ipa\":%ld}",   // v1.30: proxy-adres, via naam, s sinds gevonden
     t1Enabled() ? 1 : 0, t1.ok ? 1 : 0,
     t1.have ? (long)((now - t1.last_ok_ms) / 1000UL) : -1L,
     t1.soc, t1.usable, t1.limit, t1.state,
     t1.a_act, t1.a_req, t1.a_set, t1.volt, t1.phases, (long)t1.pw, t1.pk,
     t1.energy, t1.mins, t1.range_km, t1.port, t1_maxa, t1_cmd ? 1 : 0,
-    emsg, ecmsg);
+    emsg, ecmsg,
+    t1IpSet() ? t1_ip.toString().c_str() : "", t1_ip_named ? 1 : 0,
+    t1_found_ms ? (long)((now - t1_found_ms) / 1000UL) : -1L);
   req->send(200, "application/json", buf);
 }
 
@@ -861,7 +942,10 @@ void handleTeslaSave(AsyncWebServerRequest *req) {
   auto ph = req->getParam("host");
   auto pv = req->getParam("vin");
   auto pm = req->getParam("maxa");
-  if (ph) { t1CopyClean(t1_host, sizeof(t1_host), ph->value().c_str(), false); prefs.putString(NVS_T_HOST, t1_host); }
+  if (ph) {
+    t1CopyClean(t1_host, sizeof(t1_host), ph->value().c_str(), false); prefs.putString(NVS_T_HOST, t1_host);
+    t1InitIp(false);                     // v1.30: nieuwe host → opnieuw opzoeken (in loop, niet hier)
+  }
   if (pv) { t1CopyClean(t1_vin,  sizeof(t1_vin),  pv->value().c_str(), true);  prefs.putString(NVS_T_VIN,  t1_vin);  }
   if (pm) {
     int m = (int)pm->value().toInt();
@@ -945,10 +1029,11 @@ small{color:#666;}
 <div class='box'><hr>
 <b>Instellingen</b> <small>(worden direct bewaard, geen reboot)</small>
 <table style='margin:6px 0;width:100%'>
-<tr><td>Proxy host / IP</td><td><input type='text' id='cfh' maxlength='39' placeholder='192.168.0.xx (leeg = Tesla uit)'></td></tr>
+<tr><td>Proxy host / IP</td><td><input type='text' id='cfh' maxlength='39' placeholder='tesla-key-esp32.local of 192.168.0.xx (leeg = Tesla uit)'></td></tr>
 <tr><td>VIN</td><td><input type='text' id='cfv' maxlength='17'></td></tr>
 <tr><td>Max ampère</td><td><input type='number' id='cfa' min='5' max='32'></td></tr>
 </table>
+<div id='pip' style='font-size:12px;color:#666;margin:0 0 6px'></div>
 <button class='btn' onclick='save()'>Opslaan</button>
 </div>
 <script>
@@ -975,6 +1060,7 @@ function upd(){fetch('/tesla_json').then(function(r){return r.json()}).then(func
  $('cmsg').textContent=d.busy?'⏳ commando wordt uitgevoerd…':(d.cm?'Laatste commando: '+d.cm:'');
  $('sl').max=d.maxa;
  if(first&&d.as>=5&&d.as<=d.maxa){$('sl').value=d.as;$('av').textContent=d.as;first=0;}
+ $('pip').textContent=!d.en?'':d.ip?'Proxy-adres: '+d.ip+(d.ipn?' (gevonden via naam'+(d.ipa>=0?', '+Math.round(d.ipa/60)+' min geleden':'')+')':''):'Proxy-adres: nog niet gevonden';
  $('ts').textContent=new Date().toLocaleTimeString('nl-BE');
 }).catch(function(){var b=$('ban');b.className='banner red';b.textContent='ESP niet bereikbaar';});}
 function cmd(c,q){
@@ -1055,6 +1141,11 @@ void handleSerialCommands() {
       strlen(p1_ip) > 0 ? p1_ip : "(niet ingesteld)");
     Serial.printf("Tesla1: %s host=%s ok=%d SoC=%d%% %s %dA msg=%s\n",
       t1Enabled() ? "AAN" : "UIT", t1_host, t1.ok ? 1 : 0, t1.soc, t1.state, t1.a_act, t1.msg);
+    Serial.printf("Tesla1 adres: %s%s%s\n", t1IpSet() ? t1_ip.toString().c_str() : "onbekend",
+      t1_ip_named ? " (via naam)" : "", t1_ip_stale ? " — opnieuw zoeken" : "");
+  } else if (!strcasecmp(p, "tesla-resolve")) {       // v1.30
+    if (!t1HostIsName()) Serial.println(F("[T1] host is geen .local-naam — niets op te zoeken"));
+    else t1Resolve(true);
   } else if (!strcasecmp(p, "sim s0 on")) {
     SIM_S0 = true;  prefs.putBool(NVS_SIM_S0, true);
     Serial.println(F("[SIM_S0] AAN — S0 pulsen worden gesimuleerd"));
@@ -1069,7 +1160,7 @@ void handleSerialCommands() {
     Serial.printf("[SIM_P1] UIT — live HomeWizard P1 actief (IP: %s)\n",
       strlen(p1_ip) > 0 ? p1_ip : "⚠️  NIET INGESTELD!");
   } else if (!strcasecmp(p, "help")) {
-    Serial.println(F("Commando's: status | reset_nvs | sim s0 on/off | sim p1 on/off"));
+    Serial.println(F("Commando's: status | reset_nvs | sim s0 on/off | sim p1 on/off | tesla-resolve"));
   }
 }
 
@@ -1389,7 +1480,14 @@ void startWiFi() {
     }
     if (WiFi.status() == WL_CONNECTED) {
       Serial.println("\nVerbonden: " + WiFi.localIP().toString());
-      ap_mode = false; configTzTime(TZ_INFO, NTP_SRV); return;
+      ap_mode = false; configTzTime(TZ_INFO, NTP_SRV);
+      if (MDNS.begin(MDNS_NAME)) {                    // v1.30
+        MDNS.addService("http", "tcp", 80);
+        Serial.printf("[mDNS] http://%s.local\n", MDNS_NAME);
+      } else {
+        Serial.println(F("[mDNS] start mislukt"));
+      }
+      return;
     }
   }
 start_ap:
@@ -1404,7 +1502,7 @@ start_ap:
 void setup() {
   Serial.begin(115200); delay(300);
   Serial.println(F("\n=== S-ENERGY v" FW_VERSION " boot ==="));
-  Serial.println(F("Commando's: status | sim s0 on/off | sim p1 on/off | reset_nvs | help"));
+  Serial.println(F("Commando's: status | sim s0 on/off | sim p1 on/off | tesla-resolve | reset_nvs | help"));
 
   prefs.begin(NVS_NS, false);
   wh_sol     = prefs.getFloat(NVS_SOL,  0.0f);
@@ -1421,6 +1519,7 @@ void setup() {
   last_day   = prefs.getInt(NVS_DAY, -1);
   prefs.getString(NVS_T_HOST, t1_host, sizeof(t1_host));
   prefs.getString(NVS_T_VIN,  t1_vin,  sizeof(t1_vin));
+  t1InitIp(true);                                     // v1.30: laatst gekend proxy-adres
   t1_maxa    = (uint8_t)constrain((int)prefs.getUChar(NVS_T_MAXA, DEF_TESLA_MAXA), TESLA_AMPS_MIN, TESLA_AMPS_CAP);
   uint8_t bri = prefs.getUChar(NVS_BRI, DEF_BRIGHT);
 
@@ -1518,6 +1617,7 @@ void setup() {
   t_epex = t_15m = t_p1 = millis();
   t1_next = millis() + 5000UL;
   Serial.printf("[T1] %s host=%s maxA=%d\n", t1Enabled() ? "AAN" : "UIT (host/VIN leeg)", t1_host, t1_maxa);
+  if (t1Enabled() && t1HostIsName()) t1Resolve(true);  // v1.30: meteen het actuele adres zoeken
 
   Serial.printf("[HEAP] %d bytes  %dKB largest\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap()/1024);
   Serial.printf("HTTP: http://%s\n",

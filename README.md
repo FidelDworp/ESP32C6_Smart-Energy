@@ -8,9 +8,11 @@ Combineer solar opbrenst (Gem 11.950 kWh), electriciteits-nettarieven (Gem. verb
 ---
 
 **Zarlar Smart Energy Controller**  
-Firmware: `ESP32_C6_ENERGY/ESP32_C6_ENERGY.ino` (v1.29, sep 2026)  
+Firmware: `ESP32_C6_ENERGY/ESP32_C6_ENERGY.ino` (v1.30, nov 2026)  
 Controller-ID: `S-ENERGY`  
-IP (vast): `192.168.0.73`
+IP (vast): `192.168.0.73` · naam: `smart-energy.local` (sinds v1.30)
+
+**v1.30 — Tesla-proxy op naam:** vul op `/tesla` als host `tesla-key-esp32.local` in. S-ENERGY zoekt het adres via mDNS, onthoudt het (ook na een herstart) en zoekt opnieuw als de proxy een ander adres kreeg. Een vast IP voor de proxy is dus niet nodig (de firmware van de proxy kan dat niet en de Telenet-router laat geen reservering toe). Een IP als host werkt zoals vroeger. Serieel commando `tesla-resolve` zoekt meteen opnieuw. `/json` is ongewijzigd; `/tesla_json` kreeg achteraan `ip`, `ipn` (1 = via naam) en `ipa` (seconden sinds gevonden).
 
 ---
 
