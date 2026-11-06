@@ -751,7 +751,9 @@ Keys verwijzen naar §11.4.
 | 0 | S-HVAC | HVAC | 192.168.0.70 |
 | 1 | S-ECO | ECO Boiler | 192.168.0.71 |
 | **2** | **S-ENERGY** | **Smart Energy** | **192.168.0.73** |
-| 3 | S-OUTSIDE | Buiten (gepland) | 192.168.0.72 |
+| 3 | S-ACCESS | Buitenlichten, 4 muren W·Z·N·O (ACCESS1–3, gepland) | 192.168.0.82–84 |
+
+Rij 4 is de scheiding, rijen 5–11 zijn de ROOMs, 12–15 leeg. S-OUTSIDE (.72) heeft geen rij meer (sinds Dashboard v5.8). Volledige indeling: Master-document §8.6.
 
 ### 10.2 Kolomindeling rij 2 (S-ENERGY)
 
