@@ -431,7 +431,7 @@ De ESP32-controllers zelf worden niet gewijzigd voor remote toegang.
 ## 7. EPEX day-ahead prijsdata — plannings-UI en controller
 
 **Live testpagina:** https://fideldworp.github.io/ZarlarApp/epex-grafiek.html
-**Broncode:** `epex-grafiek.html` in GitHub repo `fideldworp/ZarlarApp`
+**Broncode:** `ESP32_Zarlar/zarlar-rpi/public/epex-grafiek.html` in GitHub repo `FidelDworp/Zarlardinge-Home-Automation`
 
 ### 7.1 Databron
 

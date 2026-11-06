@@ -2,13 +2,13 @@
 
 Combineer solar opbrenst (Gem 11.950 kWh), electriciteits-nettarieven (Gem. verbruik: 4950 kWh), verbruikers (2 EV laders, 2 Warmtepompen, 2 Was- en 2 droogmachines...) op de meest optimale wijze, zodat onze energiekosten minimaal worden.
 
-- In ons projectdocument "Energy_Management_System — Zarlardinge.md" staan alle planningdetails.
-- In het controller document "Energy_Management_System.md" staan alle conceptdetails
+- Projectdocument (planning, concept): [`docs/Energy_Management_System_Zarlardinge.md`](docs/Energy_Management_System_Zarlardinge.md)
+- Versie voor de woning van Maarten: [`docs/Smart_Energy_Zarlardinge_Maarten.md`](docs/Smart_Energy_Zarlardinge_Maarten.md)
 
 ---
 
 **Zarlar Smart Energy Controller**  
-Firmware: `ESP32_C6_ENERGY_v1_27.ino`  
+Firmware: `ESP32_C6_ENERGY/ESP32_C6_ENERGY.ino` (v1.29, sep 2026)  
 Controller-ID: `S-ENERGY`  
 IP (vast): `192.168.0.73`
 
@@ -38,8 +38,11 @@ Het doel is de energiekosten te minimaliseren door verbruikers (EV-laders, warmt
 
 | Document | Inhoud |
 |----------|--------|
-| `Zarlardinge_Smart_Energy_Management.md` | Planning & projectdetails |
-| `Energy Management System.md` | Conceptuele uitwerking van het EMS |
+| `ESP32_C6_ENERGY/` | **De sketch** (met `partitions.csv`): deze map openen in de Arduino IDE |
+| `GoogleScript/ENERGY_GoogleScript_v1.gs` | Google Apps Script voor de Sheet |
+| `docs/Energy_Management_System_Zarlardinge.md` | Planning, projectdetails en concept van het EMS |
+| `docs/Smart_Energy_Zarlardinge_Maarten.md` | Hetzelfde voor de woning van Maarten |
+| `Tesla/` | Tesla-laadsturing: uitleg (`Tesla/README.md`) en testsketch `Tesla/TeslaChargeTest/` |
 | Deze README | Technische beschrijving van de controller-firmware |
 
 ---
@@ -251,7 +254,7 @@ app1     0x610000  0x600000
 spiffs   0xC10000  0x3F0000
 ```
 
-Compileer met `partitions_16mb.csv` in de schetsmap.
+Compileer met `partitions.csv` in de schetsmap (staat in `ESP32_C6_ENERGY/`; de kop van de sketch noemt nog de oude naam `partitions_16mb.csv`).
 
 ---
 
@@ -275,7 +278,7 @@ Compileer met `partitions_16mb.csv` in de schetsmap.
 
 3. Optioneel: ntfy.sh-push bij piekoverschrijding, automatische DST, vaste opslag dynamisch ophalen.
 
-Zie ook de aparte documentatie voor de Tesla-testsketch (`Charge.test.ino`) en de geplande integratie.
+Zie ook de aparte documentatie voor de Tesla-testsketch (`Tesla/TeslaChargeTest/TeslaChargeTest.ino`, zie `Tesla/README.md`) en de geplande integratie.
 
 ---
 

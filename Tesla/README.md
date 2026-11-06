@@ -19,7 +19,7 @@ Dit project bestaat uit twee fasen:
                │ HTTP (lokaal)
 ┌──────────────▼──────────────┐
 │  ESP32-C6 (jouw controller) │
-│  - Charge.test.ino (test)   │
+│  - TeslaChargeTest.ino (test)   │
 │  - ESP32_C6_ENERGY (live)   │
 └─────────────────────────────┘
 ```
@@ -122,7 +122,7 @@ Opm: Het project is AGPL-3.0 en volledig open source. Houd het alleen op je vert
 
 ---
 
-## Fase 1 – Charge.test.ino
+## Fase 1 – TeslaChargeTest.ino
 
 Eenvoudige webinterface om de verbinding en alle laadcommando’s te testen.
 
@@ -140,7 +140,7 @@ Eenvoudige webinterface om de verbinding en alle laadcommando’s te testen.
 
 1. Flash eerst **tesla-key-esp32** op een ESP32-C6 en pair deze met de auto.
 2. Noteer het IP-adres van de tesla-key-esp32.
-3. Open `Charge.test.ino` en vul in:
+3. Open `TeslaChargeTest.ino` en vul in:
 
    ```cpp
    const char* WIFI_SSID      = "jouw-wifi";
@@ -202,7 +202,7 @@ setTeslaAmps(target_amps);   // start of stop automatisch
 - Respecteren van de maandpiek (`max_piek_w`)
 - Optioneel: alleen laden bij lage EPEX of voldoende solar
 
-De exacte implementatie volgt na succesvolle tests met `Charge.test.ino`.
+De exacte implementatie volgt na succesvolle tests met `TeslaChargeTest.ino`.
 
 ---
 
@@ -210,7 +210,7 @@ De exacte implementatie volgt na succesvolle tests met `Charge.test.ino`.
 
 | Bestand                        | Beschrijving                                      |
 |--------------------------------|---------------------------------------------------|
-| `Charge.test.ino`              | Standalone testinterface                          |
+| `TeslaChargeTest.ino`              | Standalone testinterface                          |
 | `ESP32_C6_ENERGY_v1_27.ino`    | Bestaande energie-controller (nog zonder Tesla)   |
 | `README.md`                    | Dit document                                      |
 
@@ -221,7 +221,7 @@ De exacte implementatie volgt na succesvolle tests met `Charge.test.ino`.
 | Onderdeel                      | Status            |
 |--------------------------------|-------------------|
 | tesla-key-esp32 hardware       | Te installeren    |
-| Charge.test.ino                | Klaar om te testen|
+| TeslaChargeTest.ino                | Klaar om te testen|
 | Integratie in ENERGY_v1_27     | Gepland           |
 | Live surplus-sturing           | Gepland           |
 
