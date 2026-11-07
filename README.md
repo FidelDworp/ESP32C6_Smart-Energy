@@ -41,6 +41,7 @@ Het doel is de energiekosten te minimaliseren door verbruikers (EV-laders, warmt
 | Document | Inhoud |
 |----------|--------|
 | `ESP32_C6_ENERGY/` | **De sketch** (met `partitions.csv`): deze map openen in de Arduino IDE |
+| `bin/ESP32_C6_ENERGY_v1.30.ino.bin` | De sketch klaar om te uploaden via `/update`, gecompileerd door Claude (ESP32-core 3.3.12, nieuwste bibliotheken). Alleen de laatste versie |
 | `GoogleScript/ENERGY_GoogleScript_v1.gs` | Google Apps Script voor de Sheet |
 | `docs/Energy_Management_System_Zarlardinge.md` | Planning, projectdetails en concept van het EMS |
 | `docs/Smart_Energy_Zarlardinge_Maarten.md` | Hetzelfde voor de woning van Maarten |
