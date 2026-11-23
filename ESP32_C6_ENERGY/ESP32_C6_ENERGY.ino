@@ -1,4 +1,4 @@
-// ESP32_C6_ENERGY_v1_30.ino — Zarlar Smart Energy Controller
+// ESP32_C6_ENERGY_v1_31.ino — Zarlar Smart Energy Controller
 // Developed by Filip Delannoy, april 2026 / herziening sep 2026.
 // Bereikbaar op http://192.168.0.73 of http://smart-energy.local (v1.30)
 //
@@ -10,6 +10,20 @@
 //   spiffs,  data, spiffs,0xC10000, 0x3F0000,
 //
 // ── VERSIEHISTORIE ──────────────────────────────────────────
+// 23nov26 v1.31 WIFI-HERSTEL + AP-NAAM + OTA-HERSTART (na stroompanne 23/11).
+//               (1) AP heet nu "ENERGY-Setup" (was "ZarlarSetup", te gelijk aan "Zarlar-Setup" van
+//               het dashboard), hardcoded zoals HVAC-Setup / ECO-Setup.
+//               (2) Vroeger na 12 s VOORGOED AP-modus, zonder nieuwe pogingen. Nu: één poging van 20 s
+//               bij boot, daarna wifiWatchdog() in loop(): nieuwe poging elke 30 s, fallback-AP in
+//               AP_STA-modus na 3 min (STA blijft elke 60 s proberen), AP uit zodra verbonden, herstart
+//               na 10 min zonder netwerk en zonder AP-gebruiker. Na (her)verbinden: NTP (configTzTime)
+//               en mDNS smart-energy.local opnieuw gestart (onWifiConnected()). Captive-portal-routes
+//               altijd geregistreerd (redirect alleen in AP-modus, anders 404).
+//               (3) /update, /reboot, /save_settings en /factory_reset deden delay() + ESP.restart() in
+//               de AsyncWebServer-callback → herstart bleef uit. Nu scheduleReboot() + uitvoering in
+//               loop(); factory reset wist NVS in loop(). OTA controleert Update.begin/write/end en
+//               toont de foutmelding bij mislukken.
+//               (4) Versie ook op de OTA-pagina. /json ongewijzigd.
 // 06nov26 v1.30 Tesla-proxy op naam: host mag 'tesla-key-esp32.local' zijn. S-ENERGY zoekt
 //               het adres via mDNS, onthoudt het (RAM + NVS t1_lastip) en zoekt opnieuw als
 //               een verbinding mislukt (max 1x/min, max 2 s). Een IP als host werkt zoals
@@ -91,7 +105,7 @@
 #include <strings.h>   // strcasecmp (serial-commando's)
 
 // ── VERSIE ──────────────────────────────────────────────────
-#define FW_VERSION   "1.30"
+#define FW_VERSION   "1.31"
 #define CTRL_ID      "S-ENERGY"
 #define NVS_NS       "senrg"
 #define MDNS_NAME    "smart-energy"   // v1.30: http://smart-energy.local
@@ -132,7 +146,7 @@
 const char* DEF_SSID  = "";
 const char* DEF_PASS  = "";
 const char* DEF_IP    = "192.168.0.73";
-const char* AP_SSID   = "ZarlarSetup";
+const char* AP_SSID   = "ENERGY-Setup";   // v1.31: was "ZarlarSetup" (verwarring met dashboard)
 const char* RPI_BASE  = "http://192.168.0.50:3000";
 const char* NTP_SRV   = "pool.ntp.org";
 #define     TZ_INFO    "CET-1CEST,M3.5.0,M10.5.0/3"   // CET/CEST, automatische zomertijd
@@ -176,6 +190,24 @@ Adafruit_NeoPixel strip(NUM_PIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // ── GLOBALS ─────────────────────────────────────────────────
 bool          ap_mode      = false;
+
+// v1.31: herstart nooit vanuit een AsyncWebServer-callback (AsyncTCP-taak) — loop() doet het
+volatile bool  reboot_pending   = false;
+volatile bool  reboot_clear_nvs = false;   // factory reset: NVS wissen vlak voor de herstart
+unsigned long  reboot_at        = 0;
+void scheduleReboot(unsigned long delay_ms, bool clear_nvs) {   // geen default-argument (Arduino-prototypes)
+  reboot_at        = millis() + delay_ms;
+  reboot_clear_nvs = clear_nvs;
+  reboot_pending   = true;
+}
+
+// v1.31: WiFi-herstel na stroompanne (router start trager dan de ESP32)
+#define WIFI_RETRY_MS        30000UL    // STA: nieuwe poging elke 30 s
+#define WIFI_RETRY_AP_MS     60000UL    // AP_STA: elke 60 s (stoort captive portal minder)
+#define WIFI_AP_AFTER_MS    180000UL    // na 3 min zonder WiFi: fallback-AP (AP_STA)
+#define WIFI_REBOOT_MS      600000UL    // na 10 min zonder WiFi en zonder AP-gebruiker: herstart
+unsigned long wifi_lost_since = 0;      // 0 = verbonden
+unsigned long wifi_last_retry = 0;
 bool          SIM_S0       = true;   // ⚠️ START IN SIMULATIE — zet UIT na S0 bekabeling
 bool          SIM_P1       = true;   // ⚠️ START IN SIMULATIE — zet UIT na P1-dongle (~2028)
 wl_status_t   last_wifi_st = WL_IDLE_STATUS;
@@ -1430,7 +1462,7 @@ void serveOTA(AsyncWebServerRequest *req) {
     "font-size:14px;cursor:pointer;margin-top:10px;}"
     ".btn:hover{background:#036;}.btn-red{background:#c00;}"
     "</style></head><body>"
-    "<div class='hdr'>OTA Firmware Update</div>"
+    "<div class='hdr'>" CTRL_ID " v" FW_VERSION " &middot; OTA Firmware Update</div>"
     "<div class='nav'><a href='/'>Status</a><a href='/json'>JSON</a><a href='/tesla'>Tesla</a>"
     "<a href='/update' class='act'>OTA</a><a href='/settings'>Settings</a>"
     "</div><div class='main'>"
@@ -1464,38 +1496,109 @@ void bootAnim() {
 }
 
 // ── WIFI STARTEN ────────────────────────────────────────────
-void startWiFi() {
-  if (strlen(wifi_ssid) == 0) goto start_ap;
-  {
-    IPAddress sip, gw, sn;
-    if (strlen(static_ip) > 0 && sip.fromString(static_ip)) {
-      gw.fromString("192.168.0.1"); sn.fromString("255.255.255.0");
-      WiFi.config(sip, gw, sn);
-    }
-    WiFi.begin(wifi_ssid, wifi_pass);
-    Serial.print(F("[WiFi] Verbinden"));
-    unsigned long t = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t < 12000) {
-      delay(250); Serial.print('.');
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\nVerbonden: " + WiFi.localIP().toString());
-      ap_mode = false; configTzTime(TZ_INFO, NTP_SRV);
-      if (MDNS.begin(MDNS_NAME)) {                    // v1.30
-        MDNS.addService("http", "tcp", 80);
-        Serial.printf("[mDNS] http://%s.local\n", MDNS_NAME);
-      } else {
-        Serial.println(F("[mDNS] start mislukt"));
-      }
-      return;
-    }
+// v1.31: NTP + mDNS na elke (her)verbinding
+void onWifiConnected() {
+  configTzTime(TZ_INFO, NTP_SRV);
+  MDNS.end();
+  if (MDNS.begin(MDNS_NAME)) {                    // v1.30
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("[mDNS] http://%s.local\n", MDNS_NAME);
+  } else {
+    Serial.println(F("[mDNS] start mislukt"));
   }
-start_ap:
-  Serial.println(F("\n[WiFi] Geen verbinding — AP modus"));
-  WiFi.mode(WIFI_AP); WiFi.softAP(AP_SSID);
+}
+
+// keepSta = false : pure AP (nog geen SSID ingesteld)
+// keepSta = true  : fallback AP_STA — STA blijft op de achtergrond proberen
+void startAP(bool keepSta) {
+  WiFi.mode(keepSta ? WIFI_AP_STA : WIFI_AP);
+  WiFi.softAP(AP_SSID);
   dnsServer.start(53, "*", WiFi.softAPIP());
   ap_mode = true;
-  Serial.printf("[AP] %s  %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  Serial.printf("[AP] %s (%s)  %s\n", AP_SSID, keepSta ? "AP_STA fallback" : "AP",
+                WiFi.softAPIP().toString().c_str());
+}
+
+void stopFallbackAP() {
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);   // AP uit, STA blijft
+  ap_mode = false;
+  Serial.println(F("[WiFi] Fallback-AP uit"));
+}
+
+void startWiFi() {
+  if (strlen(wifi_ssid) == 0) {
+    Serial.println(F("\n[WiFi] Geen SSID ingesteld — AP modus"));
+    startAP(false);
+    return;
+  }
+  IPAddress sip, gw, sn;
+  if (strlen(static_ip) > 0 && sip.fromString(static_ip)) {
+    gw.fromString("192.168.0.1"); sn.fromString("255.255.255.0");
+    WiFi.config(sip, gw, sn);
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(wifi_ssid, wifi_pass);
+  Serial.print(F("[WiFi] Verbinden"));
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) {   // v1.31: 12 → 20 s
+    delay(250); Serial.print('.');
+  }
+  ap_mode = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nVerbonden: " + WiFi.localIP().toString());
+    onWifiConnected();
+    wifi_lost_since = 0;
+  } else {
+    Serial.println(F("\n[WiFi] Nog niet bereikbaar — blijf proberen (fallback-AP na 3 min)"));
+    wifi_lost_since = millis();
+    wifi_last_retry = millis();
+  }
+}
+
+// v1.31: elke loop() — blijft proberen, fallback-AP na 3 min, herstart na 10 min
+void wifiWatchdog() {
+  if (strlen(wifi_ssid) == 0) return;           // pure AP-modus: niets te bewaken
+  unsigned long now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifi_lost_since != 0) {
+      Serial.printf("[WiFi] Terug verbonden na %lu s: %s\n",
+                    (now - wifi_lost_since) / 1000, WiFi.localIP().toString().c_str());
+      wifi_lost_since = 0;
+      if (ap_mode) stopFallbackAP();
+      onWifiConnected();
+    }
+    return;
+  }
+
+  // ── Niet verbonden ──
+  if (wifi_lost_since == 0) {
+    wifi_lost_since = now;
+    wifi_last_retry = now;
+    Serial.println(F("[WiFi] Verbinding kwijt — blijf proberen"));
+  }
+  unsigned long lost = now - wifi_lost_since;
+
+  if (!ap_mode && lost >= WIFI_AP_AFTER_MS) {
+    Serial.println(F("[WiFi] 3 min geen netwerk -> fallback-AP ENERGY-Setup (STA blijft proberen)"));
+    startAP(true);
+  }
+
+  unsigned long retry_ms = ap_mode ? WIFI_RETRY_AP_MS : WIFI_RETRY_MS;
+  if (now - wifi_last_retry >= retry_ms) {
+    wifi_last_retry = now;
+    Serial.printf("[WiFi] Nieuwe poging (%lu s zonder netwerk)\n", lost / 1000);
+    WiFi.disconnect(false, false);
+    WiFi.begin(wifi_ssid, wifi_pass);
+  }
+
+  if (lost >= WIFI_REBOOT_MS && WiFi.softAPgetStationNum() == 0) {
+    Serial.println(F("[WiFi] 10 min geen netwerk en niemand op de AP -> herstart"));
+    delay(200);
+    ESP.restart();
+  }
 }
 
 // ── SETUP ───────────────────────────────────────────────────
@@ -1570,31 +1673,53 @@ void setup() {
     req->send(200, "text/html",
       "<h2 style='text-align:center;padding:30px;color:#369;'>"
       "Opgeslagen &mdash; Rebooting...</h2>"
-      "<script>setTimeout(()=>location.href='/',2500);</script>");
-    delay(500); ESP.restart();
+      "<script>setTimeout(()=>location.href='/',8000);</script>");
+    scheduleReboot(1000, false);   // v1.31
   });
 
   server.on("/update", HTTP_POST,
     [](AsyncWebServerRequest *req) {
-      bool ok = !Update.hasError();
-      req->send(200, "text/html", ok
-        ? "<h2 style='color:green;text-align:center;padding:30px'>Update OK — Rebooting...</h2>"
-        : "<h2 style='color:red;text-align:center;padding:30px'>MISLUKT</h2><a href='/update'>Opnieuw</a>");
-      if (ok) { delay(1000); ESP.restart(); }
+      // v1.31: geen delay()/ESP.restart() in de callback — scheduleReboot() + loop()
+      bool ok = !Update.hasError() && Update.isFinished();
+      if (ok) {
+        req->send(200, "text/html;charset=utf-8",
+          "<meta http-equiv='refresh' content='15;url=/'>"
+          "<h2 style='color:green;text-align:center;padding:30px;font-family:Arial'>Update OK — herstart…</h2>"
+          "<p style='text-align:center;font-family:Arial'>Pagina laadt over 15 s opnieuw.</p>");
+        Serial.println(F("[OTA] OK — herstart over 1,5 s"));
+        scheduleReboot(1500, false);
+      } else {
+        char msg[200];
+        snprintf(msg, sizeof(msg),
+          "<h2 style='color:red;text-align:center;padding:30px;font-family:Arial'>Update MISLUKT</h2>"
+          "<p style='text-align:center;font-family:Arial'>Fout: %s</p><a href='/update'>Opnieuw</a>",
+          Update.errorString());
+        req->send(200, "text/html;charset=utf-8", msg);
+        Serial.printf("[OTA] MISLUKT: %s\n", Update.errorString());
+      }
     },
     [](AsyncWebServerRequest *req, String fn, size_t idx, uint8_t *data, size_t len, bool fin) {
-      if (!idx) { Update.begin(UPDATE_SIZE_UNKNOWN); }
-      Update.write(data, len);
-      if (fin && Update.end(true)) Serial.println(F("[OTA] OK"));
+      if (!idx) {
+        Serial.printf("\n=== OTA UPDATE: %s ===\n", fn.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+      }
+      if (len && Update.isRunning()) {
+        if (Update.write(data, len) != len) Update.printError(Serial);
+      }
+      if (fin) {
+        if (Update.end(true)) Serial.printf("[OTA] %u bytes geschreven\n", (unsigned)(idx + len));
+        else Update.printError(Serial);
+      }
     });
 
   server.on("/factory_reset", HTTP_GET, [](AsyncWebServerRequest *req) {
     req->send(200, "text/html", "<h2 style='text-align:center;padding:30px;color:#c00'>Factory reset — Rebooting...</h2>");
-    delay(300); prefs.clear(); delay(200); ESP.restart();
+    scheduleReboot(1000, true);   // v1.31: NVS wissen + herstart vanuit loop()
   });
   server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send(200, "text/html", "<h2 style='text-align:center;padding:30px'>Rebooting...</h2>");
-    delay(500); ESP.restart();
+    req->send(200, "text/html", "<meta http-equiv='refresh' content='15;url=/'>"
+      "<h2 style='text-align:center;padding:30px'>Rebooting...</h2>");
+    scheduleReboot(1000, false);   // v1.31
   });
   server.on("/reset_dag", HTTP_GET, [](AsyncWebServerRequest *req) {
     wh_sol = wh_schf = wh_schr = wh_won_imp = wh_won_exp = 0; saveEnergy();
@@ -1605,12 +1730,15 @@ void setup() {
     req->send(200, "text/plain", "Maandpiek gereset");
   });
 
-  if (ap_mode) {
-    server.onNotFound([](AsyncWebServerRequest *r) { r->redirect("/settings"); });
-    server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *r) { r->redirect("/settings"); });
-    server.on("/generate_204",        HTTP_GET, [](AsyncWebServerRequest *r) { r->redirect("/settings"); });
-    server.on("/ncsi.txt",            HTTP_GET, [](AsyncWebServerRequest *r) { r->redirect("/settings"); });
-  }
+  // v1.31: altijd registreren — de fallback-AP kan ook later (na 3 min) opkomen
+  auto cpRedirect = [](AsyncWebServerRequest *r) {
+    if (ap_mode) r->redirect("/settings");
+    else         r->send(404, "text/plain", "Not found");
+  };
+  server.onNotFound(cpRedirect);
+  server.on("/hotspot-detect.html", HTTP_GET, cpRedirect);
+  server.on("/generate_204",        HTTP_GET, cpRedirect);
+  server.on("/ncsi.txt",            HTTP_GET, cpRedirect);
 
   server.begin();
   fetchEpex();
@@ -1627,16 +1755,16 @@ void setup() {
 
 // ── LOOP ────────────────────────────────────────────────────
 void loop() {
+  // v1.31: geplande herstart (OTA, /reboot, settings, factory reset) — hier, niet in de web-callback
+  if (reboot_pending && (long)(millis() - reboot_at) >= 0) {
+    if (reboot_clear_nvs) { prefs.clear(); Serial.println(F("[RESET] NVS gewist")); }
+    Serial.println(F("[REBOOT] Geplande herstart"));
+    Serial.flush();
+    ESP.restart();
+  }
+  wifiWatchdog();                                 // v1.31: vervangt de oude reconnect-op-statuswissel
   if (ap_mode) dnsServer.processNextRequest();
   handleSerialCommands();
-
-  if (!ap_mode) {
-    wl_status_t ws = WiFi.status();
-    if (ws != last_wifi_st) {
-      if (ws != WL_CONNECTED) WiFi.reconnect();
-      last_wifi_st = ws;
-    }
-  }
 
   unsigned long now = millis();
 
