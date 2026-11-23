@@ -160,7 +160,7 @@ Relevante JSON-velden:
 |-----------|-----|
 | Raspberry Pi (`192.168.0.50:3000`) | EPEX-prijzen via `/api/epex` |
 | NTP | `pool.ntp.org` (tijdzone UTC+1, met zomertijd-correctie in firmware) |
-| WiFi | Station-modus; bij mislukte verbinding → SoftAP `ZarlarSetup` |
+| WiFi | Station-modus; blijft herverbinden (elke 30 s). Na 3 min zonder netwerk → fallback-SoftAP `ENERGY-Setup` (AP_STA), na 10 min herstart (v1.31) |
 
 ---
 
@@ -289,7 +289,7 @@ Zie ook de aparte documentatie voor de Tesla-testsketch (`Tesla/TeslaChargeTest/
 
 1. Open de sketch in Arduino IDE (ESP32-C6 board package).
 2. Zet partition scheme op de 16 MB-tabel hierboven.
-3. Vul eventueel default WiFi in, of configureer later via SoftAP `ZarlarSetup`.
+3. Vul eventueel default WiFi in, of configureer later via SoftAP `ENERGY-Setup`.
 4. Upload.
 5. Open `http://192.168.0.73` (of het IP dat de SoftAP toont).
 6. Zet `SIM_S0` / `SIM_P1` uit zodra de hardware aangesloten is.
