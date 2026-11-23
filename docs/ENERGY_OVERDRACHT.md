@@ -1,6 +1,6 @@
 # Overdracht — Smart Energy-controller (ESP32C6_Smart-Energy)
 
-*Stand 7 november 2026 — Filip Delannoy (FiDel), Zarlardinge (BE)*
+*Stand 23 november 2026 — Filip Delannoy (FiDel), Zarlardinge (BE)*
 
 Dit document start een nieuw gesprek met Claude over S-ENERGY: zonne-opbrengst, net, EPEX-tarieven, maandpiek en Tesla-laden. Alle details: [`README.md`](../README.md) en [`Energy_Management_System_Zarlardinge.md`](Energy_Management_System_Zarlardinge.md).
 
@@ -13,13 +13,16 @@ Dit document start een nieuw gesprek met Claude over S-ENERGY: zonne-opbrengst, 
 | | |
 |---|---|
 | Adres | `http://192.168.0.73` · `smart-energy.local` (sinds v1.30) |
-| Sketch | `ESP32_C6_ENERGY/ESP32_C6_ENERGY.ino` **v1.30** (6/11/2026) |
-| Klaar om te uploaden | `bin/ESP32_C6_ENERGY_v1.30.ino.bin` |
+| Sketch | `ESP32_C6_ENERGY/ESP32_C6_ENERGY.ino` **v1.31** (23/11/2026) |
+| Klaar om te uploaden | `bin/ESP32_C6_ENERGY_v1.31.ino.bin` |
 | Metingen | 3 S0-kanalen (zon, schuur afname/injectie), HomeWizard P1 (woning), EPEX via de RPi, matrix 12×4 |
 | Tesla | proxy `tesla-key-esp32` (firmware 0Bu, wasplaats), gevonden via mDNS `tesla-key-esp32.local` |
 | Systeemdocument | Master-document §6 en Portal Plan (energie) in `Zarlardinge-Home-Automation/docs/` |
 
-## 2. Stand (7/11)
+## 2. Stand (23/11)
+
+- **v1.31 getest en in gebruik (23/11):** AP heet nu `ENERGY-Setup` (was `ZarlarSetup`, verwarring met het Dashboard); wifi-herstel (vroeger na 12 s voorgoed AP); NTP en `smart-energy.local` opnieuw na herverbinden; captive-portal-routes altijd geregistreerd; herstart na OTA/reboot/opslaan/factory reset via `scheduleReboot()` in `loop()`; versie op de OTA-pagina. `/json` ongewijzigd.
+- **23/11 stroompanne:** de controller ging na 5 × 20 s voorgoed in AP-modus. Opgelost in deze versie: blijft de router proberen (elke 30 s), fallback-AP in AP_STA na 3 min, AP uit zodra verbonden, herstart na 10 min zonder netwerk en zonder AP-gebruiker. Zie de lessen "stroompanne" in de overkoepelende overdracht.
 
 - v1.30 werkt (heap 248 KB), **48 u-test loopt** sinds 6/11 ±21:15.
 - Post zelf niet naar Google; het Dashboard logt.
